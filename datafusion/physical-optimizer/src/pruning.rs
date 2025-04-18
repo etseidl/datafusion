@@ -1216,17 +1216,9 @@ fn is_compare_op(op: Operator) -> bool {
 // Because the "13" is less than "3" with UTF8 comparison order.
 fn verify_support_type_for_prune(from_type: &DataType, to_type: &DataType) -> Result<()> {
     // TODO: support other data type for prunable cast or try cast
-    if matches!(
-        from_type,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Decimal128(_, _)
-    ) && matches!(
-        to_type,
-        DataType::Int8 | DataType::Int32 | DataType::Int64 | DataType::Decimal128(_, _)
-    ) {
+    // These will eventually pass through `datafusion_expr_common::type_coercion::binary::binary_numeric_coercion`
+    // which will ensure the comparisons are in the proper order.
+    if from_type.is_numeric() && to_type.is_numeric() {
         Ok(())
     } else {
         plan_err!(
