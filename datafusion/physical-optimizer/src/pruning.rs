@@ -504,7 +504,7 @@ impl UnhandledPredicateHook for ConstantUnhandledPredicateHook {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ColumnOrdering {
     /// Column ordering is unknown
     Unknown,
@@ -1581,6 +1581,28 @@ fn build_predicate_expression(
         return expr;
     }
 
+    // check for floats. by now both sides should be coerced to same type
+    if left.data_type(schema).is_ok_and(|t| t.is_floating()) {
+        let colidx = column_index_for_expr(&left).or(column_index_for_expr(&right));
+        if let Some(colidx) = colidx {
+            let col_order = column_ordering[colidx];
+            match op {
+                // TODO(ets): which other operations to disallow. maybe
+                Operator::Gt
+                | Operator::GtEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::NotEq => {
+                    if col_order != ColumnOrdering::TotalOrder {
+                        dbg!(format!("Cannot prune floating point column because NaN may be present"));
+                        return unhandled_hook.handle(expr);
+                    }
+                }
+                _ => (),
+            }
+        }
+    }
+
     let expr_builder =
         PruningExpressionBuilder::try_new(&left, &right, op, schema, required_columns);
     let mut expr_builder = match expr_builder {
@@ -1595,6 +1617,17 @@ fn build_predicate_expression(
 
     build_statistics_expr(&mut expr_builder)
         .unwrap_or_else(|_| unhandled_hook.handle(expr))
+}
+
+fn column_index_for_expr(expr: &Arc<dyn PhysicalExpr>) -> Option<usize> {
+    // TODO(ets): what other types of expressions to check for here?
+    if let Some(col) = expr.as_any().downcast_ref::<phys_expr::Column>() {
+        Some(col.index())
+    } else if let Some(cast) = expr.as_any().downcast_ref::<phys_expr::CastExpr>() {
+        column_index_for_expr(cast.expr())
+    } else {
+        None
+    }
 }
 
 fn build_statistics_expr(
