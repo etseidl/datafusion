@@ -39,7 +39,7 @@ use datafusion::parquet::arrow::{
     arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter,
 };
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningStatistics};
+use datafusion::physical_optimizer::pruning::{ColumnOrdering, PruningPredicate, PruningStatistics};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::*;
 use std::any::Any;
@@ -366,10 +366,11 @@ impl ParquetMetadataIndex {
     ) -> Result<Vec<(&str, u64)>> {
         // Use the PruningPredicate API to determine which files can not
         // possibly have any relevant data.
+        let column_ordering = vec![ColumnOrdering::Unknown; self.schema().fields().len()];
         let pruning_predicate = PruningPredicate::try_new(
             predicate,
             self.schema().clone(),
-            vec![ColumnOrdering::Unknown; self.schema().fields().len()],
+            &column_ordering,
         )?;
 
         // Now evaluate the pruning predicate into a boolean mask, one element per
