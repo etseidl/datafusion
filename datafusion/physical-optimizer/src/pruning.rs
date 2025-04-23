@@ -506,9 +506,14 @@ impl UnhandledPredicateHook for ConstantUnhandledPredicateHook {
 
 #[derive(Debug, Clone, Copy)]
 pub enum ColumnOrdering {
+    /// Column ordering is unknown
     Unknown,
-    TypeDefined,
-    IEEE754,
+    /// Column ordering uses signed numeric comparison
+    Signed,
+    /// Column ordering uses unsigned numeric comparison
+    Unsigned,
+    /// Column ordering uses IEEE 754 total ordering
+    TotalOrder,
 }
 
 impl PruningPredicate {
@@ -537,7 +542,7 @@ impl PruningPredicate {
     pub fn try_new(
         expr: Arc<dyn PhysicalExpr>,
         schema: SchemaRef,
-        column_ordering: Vec<ColumnOrdering>,
+        column_ordering: &Vec<ColumnOrdering>,
     ) -> Result<Self> {
         // Get a (simpler) snapshot of the physical expr here to use with `PruningPredicate`
         // which does not handle dynamic exprs  in general
@@ -550,6 +555,7 @@ impl PruningPredicate {
             &expr,
             schema.as_ref(),
             &mut required_columns,
+            column_ordering,
             &unhandled_hook,
         );
 
@@ -1424,12 +1430,14 @@ impl PredicateRewriter {
         &self,
         expr: &Arc<dyn PhysicalExpr>,
         schema: &Schema,
+        column_ordering: &Vec<ColumnOrdering>,
     ) -> Arc<dyn PhysicalExpr> {
         let mut required_columns = RequiredColumns::new();
         build_predicate_expression(
             expr,
             schema,
             &mut required_columns,
+            column_ordering,
             &self.unhandled_hook,
         )
     }
@@ -1448,6 +1456,7 @@ fn build_predicate_expression(
     expr: &Arc<dyn PhysicalExpr>,
     schema: &Schema,
     required_columns: &mut RequiredColumns,
+    column_ordering: &Vec<ColumnOrdering>,
     unhandled_hook: &Arc<dyn UnhandledPredicateHook>,
 ) -> Arc<dyn PhysicalExpr> {
     // predicate expression can only be a binary expression
@@ -1508,6 +1517,7 @@ fn build_predicate_expression(
                 &change_expr,
                 schema,
                 required_columns,
+                column_ordering,
                 unhandled_hook,
             );
         } else {
@@ -1543,10 +1553,20 @@ fn build_predicate_expression(
     };
 
     if op == Operator::And || op == Operator::Or {
-        let left_expr =
-            build_predicate_expression(&left, schema, required_columns, unhandled_hook);
-        let right_expr =
-            build_predicate_expression(&right, schema, required_columns, unhandled_hook);
+        let left_expr = build_predicate_expression(
+            &left,
+            schema,
+            required_columns,
+            column_ordering,
+            unhandled_hook,
+        );
+        let right_expr = build_predicate_expression(
+            &right,
+            schema,
+            required_columns,
+            column_ordering,
+            unhandled_hook,
+        );
         // simplify boolean expression if applicable
         let expr = match (&left_expr, op, &right_expr) {
             (left, Operator::And, _) if is_always_true(left) => right_expr,
@@ -2317,12 +2337,9 @@ mod tests {
         ]));
         let expr = col("c1").eq(lit(100)).and(col("c2").eq(lit(200)));
         let expr = logical2physical(&expr, &schema);
-        let p = PruningPredicate::try_new(
-            expr,
-            Arc::clone(&schema),
-            vec![ColumnOrdering::Unknown; schema.fields().len()],
-        )
-        .unwrap();
+        let column_ordering = vec![ColumnOrdering::Unknown; schema.fields().len()];
+        let p = PruningPredicate::try_new(expr, Arc::clone(&schema), &column_ordering)
+            .unwrap();
         // note pruning expression refers to row_count twice
         assert_eq!(
             "c1_null_count@2 != row_count@3 AND c1_min@0 <= 100 AND 100 <= c1_max@1 AND c2_null_count@6 != row_count@3 AND c2_min@4 <= 200 AND 200 <= c2_max@5",
@@ -4646,12 +4663,18 @@ mod tests {
             Field::new("b", DataType::Int32, true),
         ]);
 
+        let column_ordering = default_column_ordering(&schema);
+
         let rewriter = PredicateRewriter::new()
             .with_unhandled_hook(Arc::new(CustomUnhandledHook {}));
 
         let transform_expr = |expr| {
             let expr = logical2physical(&expr, &schema_with_b);
-            rewriter.rewrite_predicate_to_statistics_predicate(&expr, &schema)
+            rewriter.rewrite_predicate_to_statistics_predicate(
+                &expr,
+                &schema,
+                &column_ordering,
+            )
         };
 
         // transform an arbitrary valid expression that we know is handled
@@ -4660,6 +4683,7 @@ mod tests {
             .rewrite_predicate_to_statistics_predicate(
                 &logical2physical(&known_expression, &schema),
                 &schema,
+                &column_ordering,
             );
 
         // an expression referencing an unknown column (that is not in the schema) gets passed to the hook
@@ -5173,10 +5197,11 @@ mod tests {
     ) {
         println!("Pruning with expr: {}", expr);
         let expr = logical2physical(&expr, schema);
+        let column_ordering = default_column_ordering(schema);
         let p = PruningPredicate::try_new(
             expr,
             Arc::<Schema>::clone(schema),
-            vec![ColumnOrdering::Unknown; schema.fields().len()],
+            &column_ordering,
         )
         .unwrap();
         let result = p.prune(statistics).unwrap();
@@ -5189,7 +5214,18 @@ mod tests {
         required_columns: &mut RequiredColumns,
     ) -> Arc<dyn PhysicalExpr> {
         let expr = logical2physical(expr, schema);
+        let column_ordering = default_column_ordering(schema);
         let unhandled_hook = Arc::new(ConstantUnhandledPredicateHook::default()) as _;
-        build_predicate_expression(&expr, schema, required_columns, &unhandled_hook)
+        build_predicate_expression(
+            &expr,
+            schema,
+            required_columns,
+            &column_ordering,
+            &unhandled_hook,
+        )
+    }
+
+    fn default_column_ordering(schema: &Schema) -> Vec<ColumnOrdering> {
+        vec![ColumnOrdering::Unknown; schema.fields().len()]
     }
 }

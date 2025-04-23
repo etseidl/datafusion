@@ -319,15 +319,16 @@ impl ParquetSource {
         conf = conf.with_metrics(metrics);
         conf.predicate = Some(Arc::clone(&predicate));
 
+        let column_ordering = vec![ColumnOrdering::Unknown; file_schema.fields().len()];
         conf.page_pruning_predicate = Some(build_page_pruning_predicate(
             &predicate,
             &file_schema,
-            vec![ColumnOrdering::Unknown; file_schema.fields().len()],
+            &column_ordering,
         ));
         conf.pruning_predicate = build_pruning_predicate(
             predicate,
             &file_schema,
-            vec![ColumnOrdering::Unknown; file_schema.fields().len()],
+            &column_ordering,
             &predicate_creation_errors,
         );
 

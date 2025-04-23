@@ -123,7 +123,7 @@ impl PagePruningAccessPlanFilter {
     pub fn new(
         expr: &Arc<dyn PhysicalExpr>,
         schema: SchemaRef,
-        column_orderings: Vec<ColumnOrdering>,
+        column_orderings: &Vec<ColumnOrdering>,
     ) -> Self {
         // extract any single column predicates
         let predicates = split_conjunction(expr)
@@ -132,7 +132,7 @@ impl PagePruningAccessPlanFilter {
                 let pp = match PruningPredicate::try_new(
                     Arc::clone(predicate),
                     Arc::clone(&schema),
-                    column_orderings.clone(),
+                    column_orderings,
                 ) {
                     Ok(pp) => pp,
                     Err(e) => {
