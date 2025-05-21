@@ -218,3 +218,17 @@ uninlined_format_args = "warn"
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tarpaulin)"] }
 unused_qualifications = "deny"
+
+[patch.crates-io]
+arrow = { git = "https://github.com/etseidl/arrow-rs.git", branch = "total_order" }
+arrow-array = { git = "https://github.com/etseidl/arrow-rs.git", branch = "total_order" }
+arrow-buffer = { git = "https://github.com/etseidl/arrow-rs.git", branch = "total_order" }
+arrow-cast = { git = "https://github.com/etseidl/arrow-rs.git", branch = "total_order" }
+arrow-data = { git = "https://github.com/etseidl/arrow-rs.git", branch = "total_order" }
+arrow-ipc = { git = "https://github.com/etseidl/arrow-rs.git", branch = "total_order" }
+arrow-schema = { git = "https://github.com/etseidl/arrow-rs.git", branch = "total_order" }
+arrow-select = { git = "https://github.com/etseidl/arrow-rs.git", branch = "total_order" }
+arrow-string = { git = "https://github.com/etseidl/arrow-rs.git", branch = "total_order" }
+arrow-ord = { git = "https://github.com/etseidl/arrow-rs.git", branch = "total_order" }
+arrow-flight = { git = "https://github.com/etseidl/arrow-rs.git", branch = "total_order" }
+parquet = { git = "https://github.com/etseidl/arrow-rs.git", branch = "total_order" }

@@ -394,6 +394,9 @@ impl TableParquetOptionsProto {
                     parquet_options::StatisticsTruncateLengthOpt::StatisticsTruncateLength(length as u64)
                 }),
                 data_page_row_count_limit: global_options.global.data_page_row_count_limit as u64,
+                use_ieee754_total_order_opt: global_options.global.use_ieee754_total_order.map(|enabled| {
+                    parquet_options::UseIeee754TotalOrderOpt::UseIeee754TotalOrder(enabled)
+                }),
                 encoding_opt: global_options.global.encoding.map(|encoding| {
                     parquet_options::EncodingOpt::Encoding(encoding)
                 }),
@@ -493,6 +496,9 @@ impl From<&ParquetOptionsProto> for ParquetOptions {
                 parquet_options::StatisticsTruncateLengthOpt::StatisticsTruncateLength(length) => *length as usize,
             }),
             data_page_row_count_limit: proto.data_page_row_count_limit as usize,
+            use_ieee754_total_order: proto.use_ieee754_total_order_opt.as_ref().map(|opt| match opt {
+                parquet_options::UseIeee754TotalOrderOpt::UseIeee754TotalOrder(enabled) => *enabled,
+            }),
             encoding: proto.encoding_opt.as_ref().map(|opt| match opt {
                 parquet_options::EncodingOpt::Encoding(encoding) => encoding.clone(),
             }),

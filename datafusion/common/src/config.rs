@@ -545,6 +545,11 @@ config_namespace! {
         /// (writing) Sets best effort maximum number of rows in data page
         pub data_page_row_count_limit: usize, default = 20_000
 
+        /// (writing) Use IEEE754 Total Order for floating point column statistics. This
+        /// column ordering allows for `NaN` to appear in the min/max statistics, and allows
+        /// for more pruning predicates to be applied to these columns.
+        pub use_ieee754_total_order: Option<bool>, default = Some(false)
+
         /// (writing)  Sets default encoding for any column.
         /// Valid values are: plain, plain_dictionary, rle,
         /// bit_packed, delta_binary_packed, delta_length_byte_array,

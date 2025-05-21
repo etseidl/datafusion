@@ -806,6 +806,10 @@ pub struct ParquetOptions {
     pub bloom_filter_ndv_opt: ::core::option::Option<parquet_options::BloomFilterNdvOpt>,
     #[prost(oneof = "parquet_options::CoerceInt96Opt", tags = "32")]
     pub coerce_int96_opt: ::core::option::Option<parquet_options::CoerceInt96Opt>,
+    #[prost(oneof = "parquet_options::UseIeee754TotalOrderOpt", tags = "33")]
+    pub use_ieee754_total_order_opt: ::core::option::Option<
+        parquet_options::UseIeee754TotalOrderOpt,
+    >,
 }
 /// Nested message and enum types in `ParquetOptions`.
 pub mod parquet_options {
@@ -863,6 +867,11 @@ pub mod parquet_options {
     pub enum CoerceInt96Opt {
         #[prost(string, tag = "32")]
         CoerceInt96(::prost::alloc::string::String),
+    }
+    #[derive(Clone, Copy, PartialEq, ::prost::Oneof)]
+    pub enum UseIeee754TotalOrderOpt {
+        #[prost(bool, tag = "33")]
+        UseIeee754TotalOrder(bool),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]

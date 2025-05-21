@@ -825,6 +825,7 @@ impl TryFrom<&ParquetOptions> for protobuf::ParquetOptions {
             column_index_truncate_length_opt: value.column_index_truncate_length.map(|v| protobuf::parquet_options::ColumnIndexTruncateLengthOpt::ColumnIndexTruncateLength(v as u64)),
             statistics_truncate_length_opt: value.statistics_truncate_length.map(|v| protobuf::parquet_options::StatisticsTruncateLengthOpt::StatisticsTruncateLength(v as u64)),
             data_page_row_count_limit: value.data_page_row_count_limit as u64,
+            use_ieee754_total_order_opt: value.use_ieee754_total_order.map(protobuf::parquet_options::UseIeee754TotalOrderOpt::UseIeee754TotalOrder),
             encoding_opt: value.encoding.clone().map(protobuf::parquet_options::EncodingOpt::Encoding),
             bloom_filter_on_read: value.bloom_filter_on_read,
             bloom_filter_on_write: value.bloom_filter_on_write,

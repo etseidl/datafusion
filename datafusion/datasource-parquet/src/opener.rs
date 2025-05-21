@@ -187,24 +187,21 @@ impl FileOpener for ParquetOpener {
                 logical_file_schema
                     .fields()
                     .iter()
-                    .map(|field| {
-                        match physical_file_schema.index_of(field.name()) {
-                            Ok(idx) => match column_orders[idx] {
-                                ColumnOrder::TYPE_DEFINED_ORDER(sort_order) => {
-                                    match sort_order {
-                                        SortOrder::SIGNED => ColumnOrdering::Signed,
-                                        SortOrder::UNSIGNED => ColumnOrdering::Unsigned,
-                                        _ => ColumnOrdering::Undefined,
-                                    }
+                    .map(|field| match physical_file_schema.index_of(field.name()) {
+                        Ok(idx) => match column_orders[idx] {
+                            ColumnOrder::TYPE_DEFINED_ORDER(sort_order) => {
+                                match sort_order {
+                                    SortOrder::SIGNED => ColumnOrdering::Signed,
+                                    SortOrder::UNSIGNED => ColumnOrdering::Unsigned,
+                                    _ => ColumnOrdering::Undefined,
                                 }
-                                /* TODO(ets): for future
-                                ColumnOrder::IEEE_754_TOTAL_ORDER => {
-                                    ColumnOrdering::TotalOrder
-                                }*/
-                                ColumnOrder::UNDEFINED => ColumnOrdering::Unknown,
-                            },
-                            _ => ColumnOrdering::Unknown,
-                        }
+                            }
+                            ColumnOrder::IEEE_754_TOTAL_ORDER => {
+                                ColumnOrdering::TotalOrder
+                            }
+                            ColumnOrder::UNDEFINED => ColumnOrdering::Unknown,
+                        },
+                        _ => ColumnOrdering::Unknown,
                     })
                     .collect::<Vec<_>>()
             } else {

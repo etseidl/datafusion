@@ -221,6 +221,7 @@ impl ParquetOptions {
             column_index_truncate_length,
             statistics_truncate_length,
             data_page_row_count_limit,
+            use_ieee754_total_order,
             encoding,
             bloom_filter_on_write,
             bloom_filter_fpp,
@@ -277,6 +278,9 @@ impl ParquetOptions {
         if let Some(dictionary_enabled) = dictionary_enabled {
             builder = builder.set_dictionary_enabled(*dictionary_enabled);
         };
+        if let Some(use_ieee754_total_order) = use_ieee754_total_order {
+            builder = builder.set_ieee754_total_order(*use_ieee754_total_order);
+        }
 
         // We do not have access to default ColumnProperties set in Arrow.
         // Therefore, only overwrite if these settings exist.
@@ -495,6 +499,7 @@ mod tests {
             column_index_truncate_length: Some(42),
             statistics_truncate_length: Some(42),
             data_page_row_count_limit: 42,
+            use_ieee754_total_order: Some(false),
             encoding: Some("BYTE_STREAM_SPLIT".into()),
             bloom_filter_on_write: !defaults.bloom_filter_on_write,
             bloom_filter_fpp: Some(0.42),
@@ -593,6 +598,7 @@ mod tests {
                 column_index_truncate_length: props.column_index_truncate_length(),
                 statistics_truncate_length: props.statistics_truncate_length(),
                 data_page_row_count_limit: props.data_page_row_count_limit(),
+                use_ieee754_total_order: Some(props.ieee754_total_order()),
 
                 // global options which set the default column props
                 encoding: default_col_props.encoding,

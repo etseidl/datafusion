@@ -373,6 +373,12 @@ impl SessionConfig {
         self
     }
 
+    /// Enables or disables use of IEEE 754 Total Order for floating point column statistics
+    pub fn with_ieee754_total_order(mut self, enabled: bool) -> Self {
+        self.options.execution.parquet.use_ieee754_total_order = Some(enabled);
+        self
+    }
+
     /// Enables or disables the collection of statistics after listing files
     pub fn with_collect_statistics(mut self, enabled: bool) -> Self {
         self.options.execution.collect_statistics = enabled;

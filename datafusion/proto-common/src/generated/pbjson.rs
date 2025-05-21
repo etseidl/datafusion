@@ -4984,6 +4984,9 @@ impl serde::Serialize for ParquetOptions {
         if self.coerce_int96_opt.is_some() {
             len += 1;
         }
+        if self.use_ieee754_total_order_opt.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion_common.ParquetOptions", len)?;
         if self.enable_page_index {
             struct_ser.serialize_field("enablePageIndex", &self.enable_page_index)?;
@@ -5146,6 +5149,13 @@ impl serde::Serialize for ParquetOptions {
                 }
             }
         }
+        if let Some(v) = self.use_ieee754_total_order_opt.as_ref() {
+            match v {
+                parquet_options::UseIeee754TotalOrderOpt::UseIeee754TotalOrder(v) => {
+                    struct_ser.serialize_field("useIeee754TotalOrder", v)?;
+                }
+            }
+        }
         struct_ser.end()
     }
 }
@@ -5215,6 +5225,8 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             "bloomFilterNdv",
             "coerce_int96",
             "coerceInt96",
+            "use_ieee754_total_order",
+            "useIeee754TotalOrder",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -5250,6 +5262,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             BloomFilterFpp,
             BloomFilterNdv,
             CoerceInt96,
+            UseIeee754TotalOrder,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -5302,6 +5315,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             "bloomFilterFpp" | "bloom_filter_fpp" => Ok(GeneratedField::BloomFilterFpp),
                             "bloomFilterNdv" | "bloom_filter_ndv" => Ok(GeneratedField::BloomFilterNdv),
                             "coerceInt96" | "coerce_int96" => Ok(GeneratedField::CoerceInt96),
+                            "useIeee754TotalOrder" | "use_ieee754_total_order" => Ok(GeneratedField::UseIeee754TotalOrder),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -5352,6 +5366,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                 let mut bloom_filter_fpp_opt__ = None;
                 let mut bloom_filter_ndv_opt__ = None;
                 let mut coerce_int96_opt__ = None;
+                let mut use_ieee754_total_order_opt__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::EnablePageIndex => {
@@ -5554,6 +5569,12 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             }
                             coerce_int96_opt__ = map_.next_value::<::std::option::Option<_>>()?.map(parquet_options::CoerceInt96Opt::CoerceInt96);
                         }
+                        GeneratedField::UseIeee754TotalOrder => {
+                            if use_ieee754_total_order_opt__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("useIeee754TotalOrder"));
+                            }
+                            use_ieee754_total_order_opt__ = map_.next_value::<::std::option::Option<_>>()?.map(parquet_options::UseIeee754TotalOrderOpt::UseIeee754TotalOrder);
+                        }
                     }
                 }
                 Ok(ParquetOptions {
@@ -5588,6 +5609,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                     bloom_filter_fpp_opt: bloom_filter_fpp_opt__,
                     bloom_filter_ndv_opt: bloom_filter_ndv_opt__,
                     coerce_int96_opt: coerce_int96_opt__,
+                    use_ieee754_total_order_opt: use_ieee754_total_order_opt__,
                 })
             }
         }
