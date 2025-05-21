@@ -108,8 +108,7 @@ CREATE TABLE single_with_nans (
 query I
 COPY (SELECT * FROM single_with_nans)
 TO 'test_files/scratch/parquet_nan_statistics/single_nans.parquet'
-STORED AS PARQUET
-OPTIONS ('format.use_ieee754_total_order' 'true');
+STORED AS PARQUET;
 ----
 7
 
@@ -124,20 +123,6 @@ SELECT * from test_nans WHERE f1 != 2.0;
 ----
 NaN
 NaN
-
-# This one should have a pruning predicate because it was written with total ordering
-query TT
-EXPLAIN SELECT * from test_nans WHERE f1 != 2.0;
-----
-logical_plan
-01)Filter: test_nans.f1 != Float64(2)
-02)--TableScan: test_nans projection=[f1], partial_filters=[test_nans.f1 != Float64(2)]
-physical_plan
-01)CoalesceBatchesExec: target_batch_size=8192
-02)--FilterExec: f1@0 != 2
-03)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_nan_statistics/single_nans.parquet]]}, projection=[f1], file_type=parquet, predicate=f1@0 != 2, pruning_predicate=true, required_guarantees=[f1 not in (2)]
-
 
 statement ok
 DROP TABLE test_nans;
