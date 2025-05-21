@@ -635,10 +635,8 @@ async fn prune_uint32_eq_large_in_list() {
 
 #[tokio::test]
 async fn prune_f64_lt() {
-    // TODO: because NaN could be present but not accounted for in the statistics, these
-    // expressions should not be pruned at present. When IEEE 754 total order is added to
-    // the Parquet spec this can be revisited.
-    // See https://github.com/apache/parquet-format/pull/221
+    // Because NaN could be present but not accounted for in the statistics, these
+    // expressions should not be pruned.
     RowGroupPruningTest::new()
         .with_scenario(Scenario::Float64)
         .with_query("SELECT * FROM t where f < 1")
@@ -661,15 +659,35 @@ async fn prune_f64_lt() {
         .with_expected_rows(11)
         .test_row_group_prune()
         .await;
+    // These should be pruned.
+    RowGroupPruningTest::new()
+        .with_scenario(Scenario::Float64TotalOrder)
+        .with_query("SELECT * FROM t where f < 1")
+        .with_expected_errors(Some(0))
+        .with_matched_by_stats(Some(3))
+        .with_pruned_by_stats(Some(1))
+        .with_matched_by_bloom_filter(Some(0))
+        .with_pruned_by_bloom_filter(Some(0))
+        .with_expected_rows(11)
+        .test_row_group_prune()
+        .await;
+    RowGroupPruningTest::new()
+        .with_scenario(Scenario::Float64TotalOrder)
+        .with_query("SELECT * FROM t where -f > -1")
+        .with_expected_errors(Some(0))
+        .with_matched_by_stats(Some(3))
+        .with_pruned_by_stats(Some(1))
+        .with_matched_by_bloom_filter(Some(0))
+        .with_pruned_by_bloom_filter(Some(0))
+        .with_expected_rows(11)
+        .test_row_group_prune()
+        .await;
 }
 
 #[tokio::test]
 async fn prune_f64_scalar_fun_and_gt() {
-    // TODO: because NaN could be present but not accounted for in the statistics, this
-    // expression should not be pruned at present. When IEEE 754 total order is added to
-    // the Parquet spec this can be revisited.
-    // See https://github.com/apache/parquet-format/pull/221
-
+    // Because NaN could be present but not accounted for in the statistics, this
+    // expression should not be pruned.
     // result of sql "SELECT * FROM t where abs(f - 1) <= 0.000001  and f >= 0.1"
     // only use "f >= 0" to prune
     RowGroupPruningTest::new()
@@ -678,6 +696,18 @@ async fn prune_f64_scalar_fun_and_gt() {
         .with_expected_errors(Some(0))
         .with_matched_by_stats(Some(0))
         .with_pruned_by_stats(Some(0))
+        .with_matched_by_bloom_filter(Some(0))
+        .with_pruned_by_bloom_filter(Some(0))
+        .with_expected_rows(1)
+        .test_row_group_prune()
+        .await;
+    // This should be pruned.
+    RowGroupPruningTest::new()
+        .with_scenario(Scenario::Float64TotalOrder)
+        .with_query("SELECT * FROM t where abs(f - 1) <= 0.000001  and f >= 0.1")
+        .with_expected_errors(Some(0))
+        .with_matched_by_stats(Some(2))
+        .with_pruned_by_stats(Some(2))
         .with_matched_by_bloom_filter(Some(0))
         .with_pruned_by_bloom_filter(Some(0))
         .with_expected_rows(1)

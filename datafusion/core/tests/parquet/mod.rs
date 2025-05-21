@@ -73,6 +73,7 @@ enum Scenario {
     UInt,
     UInt32Range,
     Float64,
+    Float64TotalOrder,
     Decimal,
     DecimalBloomFilterInt32,
     DecimalBloomFilterInt64,
@@ -830,7 +831,7 @@ fn create_data_batch(scenario: Scenario) -> Vec<RecordBatch> {
             vec![make_uint32_range(0, 10), make_uint32_range(200000, 300000)]
         }
 
-        Scenario::Float64 => {
+        Scenario::Float64 | Scenario::Float64TotalOrder => {
             vec![
                 make_f64_batch(vec![-5.0, -4.0, -3.0, -2.0, -1.0]),
                 make_f64_batch(vec![-4.0, -3.0, -2.0, -1.0, 0.0]),
@@ -1028,10 +1029,16 @@ async fn make_test_file_rg(scenario: Scenario, row_per_group: usize) -> NamedTem
         .tempfile()
         .expect("tempfile creation");
 
+    let total_order = match scenario {
+        Scenario::Float64TotalOrder => true,
+        _ => false,
+    };
+
     let props = WriterProperties::builder()
         .set_max_row_group_size(row_per_group)
         .set_bloom_filter_enabled(true)
         .set_statistics_enabled(EnabledStatistics::Page)
+        .set_ieee754_total_order(total_order)
         .build();
 
     let batches = create_data_batch(scenario);
@@ -1054,10 +1061,16 @@ async fn make_test_file_page(scenario: Scenario, row_per_page: usize) -> NamedTe
         .tempfile()
         .expect("tempfile creation");
 
+    let total_order = match scenario {
+        Scenario::Float64TotalOrder => true,
+        _ => false,
+    };
+
     // set row count to row_per_page, should get same result as rowGroup
     let props = WriterProperties::builder()
         .set_data_page_row_count_limit(row_per_page)
         .set_write_batch_size(row_per_page)
+        .set_ieee754_total_order(total_order)
         .build();
 
     let batches = create_data_batch(scenario);
