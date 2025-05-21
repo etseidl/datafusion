@@ -960,7 +960,7 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
                 .unwrap_or(None),
             data_page_row_count_limit: value.data_page_row_count_limit as usize,
             use_ieee754_total_order: value
-                .use_ieee754_total_order_opt.clone()
+                .use_ieee754_total_order_opt
                 .map(|opt| match opt {
                     protobuf::parquet_options::UseIeee754TotalOrderOpt::UseIeee754TotalOrder(v) => Some(v),
                 })
