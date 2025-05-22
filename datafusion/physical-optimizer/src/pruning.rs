@@ -1522,7 +1522,6 @@ fn build_predicate_expression(
             // If the ColumnOrder is undefined (as opposed to unknown), we shouldn't be pruning
             // since min/max are invalid.
             if col_order == ColumnOrdering::Undefined {
-                dbg!("Cannot prune because column order is undefined");
                 return unhandled_hook.handle(expr);
             }
 
@@ -1538,7 +1537,6 @@ fn build_predicate_expression(
                     | Operator::LtEq
                     | Operator::NotEq => {
                         if col_order != ColumnOrdering::TotalOrder {
-                            dbg!("Cannot prune floating point column because NaN may be present");
                             return unhandled_hook.handle(expr);
                         }
                     }
