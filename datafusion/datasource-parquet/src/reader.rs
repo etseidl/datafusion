@@ -11,8 +11,9 @@ use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
 use datafusion_common::HashMap;
 use datafusion_datasource::PartitionedFile;
-use datafusion_execution::cache::cache_manager::FileMetadata;
-use datafusion_execution::cache::cache_manager::FileMetadataCache;
+use datafusion_execution::cache::cache_manager::{
+    CachedFileMetadataEntry, FileMetadata, FileMetadataCache,
+};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::FutureExt;
 use futures::TryFutureExt;
@@ -77,6 +78,20 @@ pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
         metadata_size_hint: Option<usize>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>>;
+
+    /// Retain metadata augmented after the initial request, such as a deferred
+    /// page-index load, for subsequent readers of the same file.
+    ///
+    /// The default implementation does nothing. Caching factories can override
+    /// this hook using the file identity and reader options, including any
+    /// decryption properties, to apply their usual admission policy.
+    fn cache_metadata(
+        &self,
+        _partitioned_file: &PartitionedFile,
+        _metadata: Arc<ParquetMetaData>,
+        _options: &ArrowReaderOptions,
+    ) {
+    }
 }
 
 /// Default implementation of [`ParquetFileReaderFactory`]
@@ -168,6 +183,28 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         .with_metadata_cache(Some(Arc::clone(&self.metadata_cache)));
 
         Ok(Box::new(reader))
+    }
+
+    fn cache_metadata(
+        &self,
+        partitioned_file: &PartitionedFile,
+        metadata: Arc<ParquetMetaData>,
+        options: &ArrowReaderOptions,
+    ) {
+        #[cfg(feature = "parquet_encryption")]
+        if options.file_decryption_properties().is_some() {
+            return;
+        }
+        #[cfg(not(feature = "parquet_encryption"))]
+        let _ = options;
+
+        self.metadata_cache.put(
+            &partitioned_file.object_meta.location,
+            CachedFileMetadataEntry::new(
+                partitioned_file.object_meta.clone(),
+                Arc::new(crate::metadata::CachedParquetMetaData::new(metadata)),
+            ),
+        );
     }
 }
 

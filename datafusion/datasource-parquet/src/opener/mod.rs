@@ -1444,23 +1444,36 @@ impl RowGroupsPrunedParquetOpen {
 
     /// Load the page index if pruning requires it and metadata did not include it.
     async fn load_page_index(mut self) -> Result<Self> {
-        self.prepared.loaded.reader_metadata = load_page_index(
+        let options = self
+            .prepared
+            .loaded
+            .options
+            .clone()
+            .with_offset_index_policy(PageIndexPolicy::Optional)
+            .with_column_index_policy(
+                if self.prepared.page_pruning_predicate.is_some() {
+                    PageIndexPolicy::Optional
+                } else {
+                    PageIndexPolicy::Skip
+                },
+            );
+        let reader_metadata = load_page_index(
             self.prepared.loaded.reader_metadata.clone(),
             &mut self.prepared.loaded.prepared.async_file_reader,
-            self.prepared
-                .loaded
-                .options
-                .clone()
-                .with_offset_index_policy(PageIndexPolicy::Optional)
-                .with_column_index_policy(
-                    if self.prepared.page_pruning_predicate.is_some() {
-                        PageIndexPolicy::Optional
-                    } else {
-                        PageIndexPolicy::Skip
-                    },
-                ),
+            options.clone(),
         )
         .await?;
+        // The deferred byte-range load bypasses the reader's get_metadata cache.
+        self.prepared
+            .loaded
+            .prepared
+            .parquet_file_reader_factory
+            .cache_metadata(
+                &self.prepared.loaded.prepared.partitioned_file,
+                Arc::clone(reader_metadata.metadata()),
+                &options,
+            );
+        self.prepared.loaded.reader_metadata = reader_metadata;
 
         Ok(self)
     }
@@ -5348,6 +5361,108 @@ mod test {
             Some("false"),
             "cached metadata should not include page index when opener skips it"
         );
+    }
+
+    #[tokio::test]
+    async fn test_deferred_page_index_is_cached() {
+        // Exercise both predicate pruning and offset-only external selections.
+        for offset_only in [false, true] {
+            let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+            let metadata_cache: Arc<FileMetadataCache> =
+                Arc::new(DefaultCache::new(64 * 1024 * 1024));
+            let batch =
+                record_batch!(("a", Int32, (1..=100).collect::<Vec<i32>>())).unwrap();
+            let schema = batch.schema();
+            let props = WriterProperties::builder()
+                .set_statistics_enabled(EnabledStatistics::Page)
+                .set_data_page_row_count_limit(10)
+                .set_write_batch_size(10)
+                .build();
+            let data_len = write_parquet_batches(
+                Arc::clone(&store),
+                "test.parquet",
+                vec![batch],
+                Some(props),
+            )
+            .await;
+            let mut file =
+                PartitionedFile::new("test.parquet".to_string(), data_len as u64);
+            if offset_only {
+                let mut plan = ParquetAccessPlan::new_all(1);
+                plan.scan_selection(
+                    0,
+                    RowSelection::from(vec![
+                        RowSelector::skip(90),
+                        RowSelector::select(10),
+                    ]),
+                );
+                file = file.with_extension(plan);
+            }
+
+            // Seed only the footer, as the opener's initial metadata load does.
+            DFParquetMetadata::new(store.as_ref(), &file.object_meta)
+                .with_file_metadata_cache(Some(Arc::clone(&metadata_cache)))
+                .with_page_index_policy(Some(PageIndexPolicy::Skip))
+                .fetch_metadata()
+                .await
+                .unwrap();
+
+            for pass in 0..2 {
+                let metrics = ExecutionPlanMetricsSet::new();
+                let mut builder = ParquetMorselizerBuilder::new()
+                    .with_store(Arc::clone(&store))
+                    .with_schema(Arc::clone(&schema))
+                    .with_enable_page_index(true)
+                    .with_pushdown_filters(false)
+                    .with_row_group_stats_pruning(false)
+                    .with_metrics(metrics.clone())
+                    .with_parquet_file_reader_factory(Arc::new(
+                        CachedParquetFileReaderFactory::new(
+                            Arc::clone(&store),
+                            Arc::clone(&metadata_cache),
+                        ),
+                    ));
+                if !offset_only {
+                    builder = builder.with_predicate(logical2physical(
+                        &col("a").gt(lit(90i32)),
+                        &schema,
+                    ));
+                }
+                let stream = open_file(&builder.build(), file.clone()).await.unwrap();
+                let index_bytes = counter_metric_value(&metrics, "bytes_scanned");
+                if pass == 0 {
+                    assert!(index_bytes > 0, "first open must fetch page indexes");
+                } else {
+                    assert_eq!(index_bytes, 0, "second open must reuse page indexes");
+                }
+                let cached = metadata_cache.get(&file.object_meta.location).unwrap();
+                let metadata = cached
+                    .file_metadata
+                    .as_any()
+                    .downcast_ref::<CachedParquetMetaData>()
+                    .unwrap()
+                    .parquet_metadata();
+                let indexes = metadata.page_index().expect("deferred indexes cached");
+                assert!(indexes.has_offset_indexes());
+                assert_eq!(indexes.has_column_indexes(), !offset_only);
+
+                // Consume successfully as well: zero open-time I/O must not mean
+                // that the scan was skipped or that an error was discarded.
+                let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+                let result: Vec<i32> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_primitive::<Int32Type>()
+                            .values()
+                            .iter()
+                            .copied()
+                    })
+                    .collect();
+                assert_eq!(result, (91..=100).collect::<Vec<_>>());
+            }
+        }
     }
 
     #[tokio::test]
