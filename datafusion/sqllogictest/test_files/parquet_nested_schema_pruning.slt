@@ -447,7 +447,7 @@ Plan with Metrics DataSourceExec: <slt:ignore>metrics=[output_rows=2, <slt:ignor
 query TT
 explain analyze select s from full_schema where id >= 2;
 ----
-Plan with Metrics DataSourceExec: <slt:ignore>metrics=[output_rows=2, <slt:ignore>bytes_scanned=292.0 B<slt:ignore>]
+Plan with Metrics DataSourceExec: <slt:ignore>metrics=[output_rows=2, <slt:ignore>bytes_scanned=306.0 B<slt:ignore>]
 
 statement ok
 set datafusion.execution.parquet.pushdown_filters = false;

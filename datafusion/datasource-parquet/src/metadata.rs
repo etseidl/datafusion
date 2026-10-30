@@ -33,6 +33,7 @@ use parquet::DecodeResult;
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::parquet_to_arrow_schema;
 use parquet::basic::{ColumnOrder, SortOrder, Type as PhysicalType};
+use parquet::errors::ParquetError;
 use parquet::file::metadata::{
     PageIndexPolicy, ParquetMetaData, ParquetMetaDataPushDecoder, ParquetMetaDataReader,
     RowGroupMetaData, SortingColumn,
@@ -137,6 +138,8 @@ pub struct DFParquetMetadata<'a> {
     /// `None` means the effective policy is chosen automatically, see
     /// [`DFParquetMetadata::effective_page_index_policy`].
     page_index_policy: Option<PageIndexPolicy>,
+    /// Exact independent index requests; absent means the whole file.
+    page_index_selection: Option<PageIndexSelection>,
     /// timeunit to coerce INT96 timestamps to
     pub coerce_int96: Option<TimeUnit>,
     /// Optional timezone applied to INT96-coerced timestamps.
@@ -158,6 +161,7 @@ impl<'a> DFParquetMetadata<'a> {
             decryption_properties: None,
             file_metadata_cache: None,
             page_index_policy: None,
+            page_index_selection: None,
             coerce_int96: None,
             coerce_int96_tz: None,
             enable_rle_to_dictionary: false,
@@ -219,6 +223,18 @@ impl<'a> DFParquetMetadata<'a> {
         self
     }
 
+    /// Limit explicit `Optional` or `Required` page-index requests to independent
+    /// column- and offset-index coordinates. Without a selection, these policies
+    /// request all indexes in the file. An empty selection requests none.
+    ///
+    /// Coordinates must be valid file-global row groups and physical leaves;
+    /// they are not validated. `None` and `Skip` policies ignore this selection.
+    /// Arrow's masks may also decode the Cartesian product of each kind's axes.
+    pub fn with_page_index_selection(mut self, selection: PageIndexSelection) -> Self {
+        self.page_index_selection = Some(selection);
+        self
+    }
+
     /// Set the [`TimeUnit`] that INT96 timestamp columns should be coerced
     /// to when reading the schema.
     ///
@@ -245,24 +261,6 @@ impl<'a> DFParquetMetadata<'a> {
     /// falls back to reading from the object store via
     /// [`ParquetMetaDataPushDecoder`] on a cache miss.
     pub async fn fetch_metadata(&self) -> Result<Arc<ParquetMetaData>> {
-        // fetch_metadata
-        // │
-        // ├─ cache_metadata = encryption check
-        // ├─ page_index_policy = caller override OR default
-        // │
-        // ├─ CACHE HIT?
-        // │   │
-        // │   ├─ has index OR policy=Skip?  → return cache
-        // │   │
-        // │   └─ else (footer only, wants index)
-        // │         → load_page_index (index bytes only)
-        // │         → cache_metadata() if allowed
-        // │         → return
-        // │
-        // └─ CACHE MISS
-        //       → fetch_metadata_from_store(policy)
-        //       → cache_metadata() if allowed
-        //       → return
         let cache_metadata =
             !cfg!(feature = "parquet_encryption") || self.decryption_properties.is_none();
         let page_index_policy = self.effective_page_index_policy();
@@ -277,23 +275,38 @@ impl<'a> DFParquetMetadata<'a> {
                 .downcast_ref::<CachedParquetMetaData>()
         {
             let cached_metadata = Arc::clone(cached_parquet.parquet_metadata());
-            // Reuse the cache when it already has page index, or when the caller
-            // asked to skip page index I/O (footer-only metadata is sufficient).
-            if Self::metadata_has_page_index(cached_metadata.as_ref())
-                || page_index_policy == PageIndexPolicy::Skip
-            {
+            // Footer-only requests must not inspect page-index providers.
+            if page_index_policy == PageIndexPolicy::Skip {
                 return Ok(cached_metadata);
             }
-            let metadata =
-                Self::load_page_index(self.store, self.object_meta, cached_metadata)
-                    .await?;
+            let metadata = self
+                .load_page_index(cached_metadata, page_index_policy)
+                .await?;
+            if Arc::ptr_eq(&metadata, cached_parquet.parquet_metadata()) {
+                return Ok(metadata);
+            }
             if cache_metadata {
                 self.cache_metadata(Arc::clone(&metadata))?;
             }
             return Ok(metadata);
         }
 
-        let metadata = self.fetch_metadata_from_store(page_index_policy).await?;
+        // Scoped requests first decode the footer, then load only missing indexes.
+        // Unscoped misses retain Arrow's whole-file policy and prefetch behavior.
+        let scoped = page_index_policy != PageIndexPolicy::Skip
+            && self.page_index_selection.is_some();
+        let metadata = self
+            .fetch_metadata_from_store(if scoped {
+                PageIndexPolicy::Skip
+            } else {
+                page_index_policy
+            })
+            .await?;
+        let metadata = if scoped {
+            self.load_page_index(metadata, page_index_policy).await?
+        } else {
+            metadata
+        };
         if cache_metadata {
             self.cache_metadata(Arc::clone(&metadata))?;
         }
@@ -305,29 +318,6 @@ impl<'a> DFParquetMetadata<'a> {
         // Planning needs the footer, not all page indexes. The opener derives
         // the required column chunks after row-group pruning.
         self.page_index_policy.unwrap_or(PageIndexPolicy::Skip)
-    }
-
-    /// Check whether `metadata` already has both the column index and the
-    /// offset index populated (see [`ParquetMetaData::page_index`]).
-    ///
-    /// Used to decide whether page index I/O can be skipped.
-    fn metadata_has_page_index(metadata: &ParquetMetaData) -> bool {
-        let Some(provider) = metadata.page_index() else {
-            return false;
-        };
-        if !provider.as_any().is::<CachedPageIndexes>() {
-            return provider.is_complete();
-        }
-        let mut selection = PageIndexSelection::new();
-        for row_group in 0..metadata.num_row_groups() {
-            for leaf in 0..metadata.file_metadata().schema_descr().num_columns() {
-                selection.add_column_index(row_group, leaf);
-                selection.add_offset_index(row_group, leaf);
-            }
-        }
-        selection
-            .missing(metadata, Some(provider.as_ref()))
-            .is_empty()
     }
 
     /// Store `metadata` in the configured [`FileMetadataCache`], keyed by
@@ -401,26 +391,108 @@ impl<'a> DFParquetMetadata<'a> {
         Ok(Arc::new(metadata))
     }
 
-    /// If `metadata` does not already have a page index, fetch and attach the
-    /// column and offset indexes.
+    /// Match Arrow's Required policy before advertised-only missing filters drop
+    /// absent offset coordinates. Files/scopes with no selected ranges are accepted.
+    fn validate_required_offset_indexes(&self, metadata: &ParquetMetaData) -> Result<()> {
+        let (has_ranges, missing_offset) = if let Some(selection) =
+            &self.page_index_selection
+        {
+            let has_ranges =
+                selection.column_indexes().iter().any(|&(rg, leaf)| {
+                    metadata
+                        .row_group(rg)
+                        .column(leaf)
+                        .column_index_range()
+                        .is_some()
+                }) || selection.offset_indexes().iter().any(|&(rg, leaf)| {
+                    metadata
+                        .row_group(rg)
+                        .column(leaf)
+                        .offset_index_range()
+                        .is_some()
+                });
+            let missing_offset = selection.offset_indexes().iter().any(|&(rg, leaf)| {
+                metadata
+                    .row_group(rg)
+                    .column(leaf)
+                    .offset_index_range()
+                    .is_none()
+            });
+            (has_ranges, missing_offset)
+        } else {
+            let has_ranges = metadata.row_groups().iter().any(|group| {
+                group.columns().iter().any(|column| {
+                    column.column_index_range().is_some()
+                        || column.offset_index_range().is_some()
+                })
+            });
+            let missing_offset = metadata.row_groups().iter().any(|group| {
+                group
+                    .columns()
+                    .iter()
+                    .any(|column| column.offset_index_range().is_none())
+            });
+            (has_ranges, missing_offset)
+        };
+        if has_ranges && missing_offset {
+            return Err(ParquetError::General("missing offset index".to_owned()).into());
+        }
+        Ok(())
+    }
+
+    /// Fetch unresolved advertised indexes, retaining all previous resolutions.
     async fn load_page_index(
-        store: &dyn ObjectStore,
-        object_meta: &ObjectMeta,
+        &self,
         metadata: Arc<ParquetMetaData>,
+        policy: PageIndexPolicy,
     ) -> Result<Arc<ParquetMetaData>> {
-        if Self::metadata_has_page_index(&metadata) {
+        if policy == PageIndexPolicy::Required {
+            self.validate_required_offset_indexes(&metadata)?;
+        }
+        let missing = if let Some(selection) = &self.page_index_selection {
+            selection.missing(&metadata, metadata.page_index().map(Arc::as_ref))
+        } else {
+            if PageIndexSelection::all_resolved(&metadata) {
+                return Ok(metadata);
+            }
+            PageIndexSelection::all_missing(&metadata)
+        };
+        if missing.is_empty() {
             return Ok(metadata);
         }
+        let indexes = CachedPageIndexes::from_metadata(&metadata);
         let metadata =
             Arc::try_unwrap(metadata).unwrap_or_else(|shared| (*shared).clone());
-        let mut reader = ParquetMetaDataReader::new_with_metadata(metadata)
-            .with_page_index_policy(PageIndexPolicy::Optional);
-        let fetch = ObjectStoreFetch::new(store, object_meta);
-        reader
-            .load_page_index(fetch)
+        // Required was checked against the original exact scope above. Arrow's
+        // Cartesian masks may include unrequested chunks without offset ranges;
+        // Optional decoding avoids imposing Required on those cross-coordinates.
+        // Malformed advertised indexes still fail decoding under Optional.
+        let decode_policy = if policy == PageIndexPolicy::Required
+            && self.page_index_selection.is_some()
+        {
+            PageIndexPolicy::Optional
+        } else {
+            policy
+        };
+        let reader = ParquetMetaDataReader::new_with_metadata(metadata)
+            .with_page_index_policy(decode_policy)
+            .with_column_index_mask(missing.column_index_mask())
+            .with_offset_index_mask(missing.offset_index_mask());
+        #[cfg(feature = "parquet_encryption")]
+        let reader =
+            reader.with_decryption_properties(self.decryption_properties.clone());
+        let fetch = ObjectStoreFetch::new(self.store, self.object_meta);
+        let (metadata, decoded) = reader
+            .load_page_index_and_finish(fetch)
             .await
             .map_err(DataFusionError::from)?;
-        Ok(Arc::new(reader.finish().map_err(DataFusionError::from)?))
+        let indexes = indexes.merge(&CachedPageIndexes::from_decoded(decoded, &missing));
+        Ok(Arc::new(
+            metadata
+                .into_builder()
+                .set_page_index(Some(Arc::new(indexes)))
+                .build(),
+        ))
     }
 
     /// Fetch this file's [`ParquetMetaData`] and convert its embedded Thrift
@@ -1143,22 +1215,7 @@ pub(crate) fn cache_parquet_metadata(
                         // A fully indexed warm entry must not be replaced by a
                         // query subset. Generic providers cannot share entries
                         // individually, so transfer their populated coordinates once.
-                        let mut selection = PageIndexSelection::new();
-                        for row_group in 0..cached.metadata.num_row_groups() {
-                            for leaf in 0..cached
-                                .metadata
-                                .file_metadata()
-                                .schema_descr()
-                                .num_columns()
-                            {
-                                selection.add_column_index(row_group, leaf);
-                                selection.add_offset_index(row_group, leaf);
-                            }
-                        }
-                        indexes = CachedPageIndexes::from_provider(
-                            provider.as_ref(),
-                            &selection,
-                        );
+                        indexes = CachedPageIndexes::from_metadata(&cached.metadata);
                     }
                 }
             }
@@ -1364,6 +1421,376 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow::compute::SortOptions;
     use arrow::datatypes::Field;
+    use object_store::ObjectStoreExt;
+
+    async fn page_index_test_file() -> (object_store::memory::InMemory, ObjectMeta) {
+        page_index_test_file_with_offset_indexes(true).await
+    }
+
+    async fn page_index_test_file_with_offset_indexes(
+        offset_indexes: bool,
+    ) -> (object_store::memory::InMemory, ObjectMeta) {
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::{EnabledStatistics, WriterProperties};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let values = Arc::new(Int32Array::from_iter_values(0..12)) as ArrayRef;
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&values), values])
+                .unwrap();
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_dictionary_enabled(false)
+            .set_max_row_group_row_count(Some(4))
+            .set_data_page_row_count_limit(2)
+            .set_write_batch_size(2)
+            .build();
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        let mut bytes = writer.into_inner().unwrap();
+        if !offset_indexes {
+            use parquet::file::metadata::ParquetMetaDataWriter;
+            use parquet::file::writer::TrackedWrite;
+            use std::io::Write;
+
+            // Page statistics force the writer to enable offset indexes. Remove
+            // their footer locations, preserving the real column-index bytes.
+            let metadata = ParquetMetaDataReader::new()
+                .parse_and_finish(&bytes::Bytes::from(bytes.clone()))
+                .unwrap();
+            let row_groups = metadata
+                .row_groups()
+                .iter()
+                .map(|group| {
+                    let columns = group
+                        .columns()
+                        .iter()
+                        .map(|column| {
+                            column
+                                .clone()
+                                .into_builder()
+                                .set_offset_index_offset(None)
+                                .set_offset_index_length(None)
+                                .build()
+                                .unwrap()
+                        })
+                        .collect();
+                    group
+                        .clone()
+                        .into_builder()
+                        .set_column_metadata(columns)
+                        .build()
+                        .unwrap()
+                })
+                .collect();
+            let metadata = metadata.into_builder().set_row_groups(row_groups).build();
+            let footer_len = u32::from_le_bytes(
+                bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap(),
+            ) as usize;
+            bytes.truncate(bytes.len() - 8 - footer_len);
+            let prefix = std::mem::take(&mut bytes);
+            let mut tracked = TrackedWrite::new(&mut bytes);
+            tracked.write_all(&prefix).unwrap();
+            ParquetMetaDataWriter::new_with_tracked(tracked, &metadata)
+                .finish()
+                .unwrap();
+        }
+        let store = object_store::memory::InMemory::new();
+        let location = Path::from("indexes.parquet");
+        store.put(&location, bytes.into()).await.unwrap();
+        let object_meta = store.head(&location).await.unwrap();
+        (store, object_meta)
+    }
+
+    #[tokio::test]
+    async fn test_fetch_metadata_scoped_miss_reuse_expand_and_full() {
+        use datafusion_execution::cache::default_cache::DefaultCache;
+
+        for policy in [PageIndexPolicy::Optional, PageIndexPolicy::Required] {
+            let (store, object_meta) = page_index_test_file().await;
+            let cache: Arc<FileMetadataCache> = Arc::new(DefaultCache::new(1024 * 1024));
+            let mut selection = PageIndexSelection::new();
+            selection.add_column_index(1, 0);
+            selection.add_offset_index(2, 1);
+            let scoped = DFParquetMetadata::new(&store, &object_meta)
+                .with_file_metadata_cache(Some(Arc::clone(&cache)))
+                .with_page_index_policy(Some(policy))
+                .with_page_index_selection(selection.clone());
+            let first = scoped.fetch_metadata().await.unwrap();
+            let indexes = first.page_index().unwrap();
+            assert!(indexes.column_index(1, 0).is_some());
+            assert!(indexes.offset_index(2, 1).is_some());
+            assert!(indexes.offset_index(1, 0).is_none());
+            assert!(indexes.column_index(2, 1).is_none());
+            let first_column = indexes.column_index(1, 0).unwrap();
+            let first_offset = indexes.offset_index(2, 1).unwrap();
+
+            // A different, empty store proves identical and empty scopes need no I/O.
+            let unavailable = object_store::memory::InMemory::new();
+            let repeat = DFParquetMetadata::new(&unavailable, &object_meta)
+                .with_file_metadata_cache(Some(Arc::clone(&cache)))
+                .with_page_index_policy(Some(policy))
+                .with_page_index_selection(selection.clone());
+            let reused = repeat.fetch_metadata().await.unwrap();
+            let reused_again = repeat.fetch_metadata().await.unwrap();
+            assert!(Arc::ptr_eq(&reused, &reused_again));
+            let empty = DFParquetMetadata::new(&unavailable, &object_meta)
+                .with_file_metadata_cache(Some(Arc::clone(&cache)))
+                .with_page_index_policy(Some(policy))
+                .with_page_index_selection(PageIndexSelection::new())
+                .fetch_metadata()
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&reused, &empty));
+
+            selection.add_column_index(0, 1);
+            selection.add_offset_index(0, 0);
+            let expanded = DFParquetMetadata::new(&store, &object_meta)
+                .with_file_metadata_cache(Some(Arc::clone(&cache)))
+                .with_page_index_policy(Some(policy))
+                .with_page_index_selection(selection)
+                .fetch_metadata()
+                .await
+                .unwrap();
+            let indexes = expanded.page_index().unwrap();
+            assert!(indexes.column_index(0, 1).is_some());
+            assert!(indexes.offset_index(0, 0).is_some());
+            assert!(std::ptr::eq(
+                first_column,
+                indexes.column_index(1, 0).unwrap()
+            ));
+            assert!(std::ptr::eq(
+                first_offset,
+                indexes.offset_index(2, 1).unwrap()
+            ));
+            assert!(indexes.column_index(2, 0).is_none());
+
+            let full = DFParquetMetadata::new(&store, &object_meta)
+                .with_file_metadata_cache(Some(cache))
+                .with_page_index_policy(Some(policy))
+                .fetch_metadata()
+                .await
+                .unwrap();
+            let indexes = full.page_index().unwrap();
+            for rg in 0..3 {
+                for leaf in 0..2 {
+                    assert!(indexes.column_index(rg, leaf).is_some());
+                    assert!(indexes.offset_index(rg, leaf).is_some());
+                }
+            }
+            assert!(std::ptr::eq(
+                first_column,
+                indexes.column_index(1, 0).unwrap()
+            ));
+            assert!(std::ptr::eq(
+                first_offset,
+                indexes.offset_index(2, 1).unwrap()
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_metadata_scoped_required_missing_offset_index() {
+        // This valid file advertises column indexes but no offset indexes.
+        let (store, object_meta) = page_index_test_file_with_offset_indexes(false).await;
+        let footer = DFParquetMetadata::new(&store, &object_meta)
+            .fetch_metadata()
+            .await
+            .unwrap();
+        assert!(footer.row_group(1).column(0).column_index_range().is_some());
+        assert!(footer.row_group(1).column(0).offset_index_range().is_none());
+        let mut selection = PageIndexSelection::new();
+        selection.add_column_index(1, 0);
+        selection.add_offset_index(1, 0);
+        for policy in [PageIndexPolicy::Required, PageIndexPolicy::Optional] {
+            let result = DFParquetMetadata::new(&store, &object_meta)
+                .with_page_index_policy(Some(policy))
+                .with_page_index_selection(selection.clone())
+                .fetch_metadata()
+                .await;
+            if policy == PageIndexPolicy::Required {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("missing offset index")
+                );
+            } else {
+                let metadata = result.unwrap();
+                let indexes = metadata.page_index().unwrap();
+                assert!(indexes.column_index(1, 0).is_some());
+                assert!(indexes.offset_index(1, 0).is_none());
+            }
+        }
+        // No selected ranges: Arrow's compatibility exception still applies,
+        // even though unselected column-index ranges exist elsewhere in the file.
+        let mut no_ranges = PageIndexSelection::new();
+        no_ranges.add_offset_index(1, 0);
+        let metadata = DFParquetMetadata::new(&store, &object_meta)
+            .with_page_index_policy(Some(PageIndexPolicy::Required))
+            .with_page_index_selection(no_ranges)
+            .fetch_metadata()
+            .await
+            .unwrap();
+        assert!(metadata.page_index().is_none());
+
+        // An unscoped cold read continues to use Arrow's original validation.
+        let error = DFParquetMetadata::new(&store, &object_meta)
+            .with_page_index_policy(Some(PageIndexPolicy::Required))
+            .fetch_metadata()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing offset index"));
+
+        // The whole-file cached-footer path must not filter away the same absence.
+        use datafusion_execution::cache::default_cache::DefaultCache;
+        let cache: Arc<FileMetadataCache> = Arc::new(DefaultCache::new(1024 * 1024));
+        DFParquetMetadata::new(&store, &object_meta)
+            .with_file_metadata_cache(Some(Arc::clone(&cache)))
+            .fetch_metadata()
+            .await
+            .unwrap();
+        let error = DFParquetMetadata::new(&store, &object_meta)
+            .with_file_metadata_cache(Some(cache))
+            .with_page_index_policy(Some(PageIndexPolicy::Required))
+            .fetch_metadata()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing offset index"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_metadata_scoped_required_ignores_unrequested_cross_offsets() {
+        let (store, object_meta) = page_index_test_file().await;
+        let footer = DFParquetMetadata::new(&store, &object_meta)
+            .fetch_metadata()
+            .await
+            .unwrap();
+        let mut row_groups = footer.row_groups().to_vec();
+        for (rg, leaf) in [(0, 1), (1, 0)] {
+            let mut columns = row_groups[rg].columns().to_vec();
+            columns[leaf] = columns[leaf]
+                .clone()
+                .into_builder()
+                .set_offset_index_offset(None)
+                .set_offset_index_length(None)
+                .build()
+                .unwrap();
+            row_groups[rg] = row_groups[rg]
+                .clone()
+                .into_builder()
+                .set_column_metadata(columns)
+                .build()
+                .unwrap();
+        }
+        // Retain actual byte locations for the requested diagonal coordinates.
+        let footer = Arc::new(
+            footer
+                .as_ref()
+                .clone()
+                .into_builder()
+                .set_row_groups(row_groups)
+                .build(),
+        );
+        let mut selection = PageIndexSelection::new();
+        selection.add_offset_index(0, 0);
+        selection.add_offset_index(1, 1);
+        let metadata = DFParquetMetadata::new(&store, &object_meta)
+            .with_page_index_selection(selection)
+            .load_page_index(footer, PageIndexPolicy::Required)
+            .await
+            .unwrap();
+        let indexes = metadata.page_index().unwrap();
+        assert!(indexes.offset_index(0, 0).is_some());
+        assert!(indexes.offset_index(1, 1).is_some());
+        assert!(indexes.offset_index(0, 1).is_none());
+        assert!(indexes.offset_index(1, 0).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_metadata_empty_scope_miss() {
+        let (store, object_meta) = page_index_test_file().await;
+        let metadata = DFParquetMetadata::new(&store, &object_meta)
+            .with_page_index_policy(Some(PageIndexPolicy::Required))
+            .with_page_index_selection(PageIndexSelection::new())
+            .fetch_metadata()
+            .await
+            .unwrap();
+        assert!(metadata.page_index().is_none());
+        assert_eq!(metadata.num_row_groups(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_metadata_skip_never_inspects_provider() {
+        use datafusion_execution::cache::default_cache::DefaultCache;
+        use parquet::file::metadata::page_index::PageIndexProvider;
+        use parquet::file::page_index::column_index::ColumnIndexMetaData;
+        use parquet::file::page_index::offset_index::OffsetIndexMetaData;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountingProvider(Arc<AtomicUsize>);
+        impl PageIndexProvider for CountingProvider {
+            fn as_any(&self) -> &dyn Any {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                self
+            }
+            fn has_column_indexes(&self) -> bool {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            fn has_offset_indexes(&self) -> bool {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            fn column_index(&self, _: usize, _: usize) -> Option<&ColumnIndexMetaData> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            fn offset_index(&self, _: usize, _: usize) -> Option<&OffsetIndexMetaData> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+        let (store, object_meta) = page_index_test_file().await;
+        let footer = DFParquetMetadata::new(&store, &object_meta)
+            .fetch_metadata()
+            .await
+            .unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let metadata = Arc::new(
+            footer
+                .as_ref()
+                .clone()
+                .into_builder()
+                .set_page_index(Some(Arc::new(CountingProvider(Arc::clone(&count)))))
+                .build(),
+        );
+        let cache: Arc<FileMetadataCache> = Arc::new(DefaultCache::new(1024 * 1024));
+        cache.put(
+            &object_meta.location,
+            CachedFileMetadataEntry::new(
+                object_meta.clone(),
+                Arc::new(CachedParquetMetaData::new(Arc::clone(&metadata))),
+            ),
+        );
+        count.store(0, Ordering::Relaxed);
+        let unavailable = object_store::memory::InMemory::new();
+        for policy in [None, Some(PageIndexPolicy::Skip)] {
+            let fetched = DFParquetMetadata::new(&unavailable, &object_meta)
+                .with_file_metadata_cache(Some(Arc::clone(&cache)))
+                .with_page_index_policy(policy)
+                .fetch_metadata()
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&metadata, &fetched));
+            assert_eq!(count.load(Ordering::Relaxed), 0);
+        }
+    }
 
     #[test]
     fn test_scoped_cache_merge_identity_and_accounting() {

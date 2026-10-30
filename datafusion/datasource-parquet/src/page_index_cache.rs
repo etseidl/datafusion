@@ -68,6 +68,67 @@ impl PageIndexSelection {
         )
     }
 
+    /// Returns whether every advertised coordinate in the file is resolved.
+    /// Traversal stops at the first unresolved index without allocating a selection.
+    pub(crate) fn all_resolved(metadata: &ParquetMetaData) -> bool {
+        let provider = metadata.page_index().map(Arc::as_ref);
+        metadata.row_groups().iter().enumerate().all(|(rg, group)| {
+            group.columns().iter().enumerate().all(|(leaf, column)| {
+                (column.column_index_range().is_none()
+                    || Self::column_resolved(provider, rg, leaf))
+                    && (column.offset_index_range().is_none()
+                        || Self::offset_resolved(provider, rg, leaf))
+            })
+        })
+    }
+
+    /// Collects only unresolved advertised coordinates for a whole-file request.
+    pub(crate) fn all_missing(metadata: &ParquetMetaData) -> Self {
+        let provider = metadata.page_index().map(Arc::as_ref);
+        let mut missing = Self::new();
+        for (rg, group) in metadata.row_groups().iter().enumerate() {
+            for (leaf, column) in group.columns().iter().enumerate() {
+                if column.column_index_range().is_some()
+                    && !Self::column_resolved(provider, rg, leaf)
+                {
+                    missing.add_column_index(rg, leaf);
+                }
+                if column.offset_index_range().is_some()
+                    && !Self::offset_resolved(provider, rg, leaf)
+                {
+                    missing.add_offset_index(rg, leaf);
+                }
+            }
+        }
+        missing
+    }
+
+    fn column_resolved(
+        provider: Option<&dyn PageIndexProvider>,
+        rg: usize,
+        leaf: usize,
+    ) -> bool {
+        provider.is_some_and(|p| {
+            p.as_any()
+                .downcast_ref::<CachedPageIndexes>()
+                .is_some_and(|c| c.column_indexes.contains_key(&(rg, leaf)))
+                || p.column_index(rg, leaf).is_some()
+        })
+    }
+
+    fn offset_resolved(
+        provider: Option<&dyn PageIndexProvider>,
+        rg: usize,
+        leaf: usize,
+    ) -> bool {
+        provider.is_some_and(|p| {
+            p.as_any()
+                .downcast_ref::<CachedPageIndexes>()
+                .is_some_and(|c| c.offset_indexes.contains_key(&(rg, leaf)))
+                || p.offset_index(rg, leaf).is_some()
+        })
+    }
+
     /// Returns unresolved requests whose footer advertises an index range.
     ///
     /// A generic provider's `None` means unknown, not known absent. Only this
@@ -78,8 +139,6 @@ impl PageIndexSelection {
         metadata: &ParquetMetaData,
         provider: Option<&dyn PageIndexProvider>,
     ) -> Self {
-        let cached =
-            provider.and_then(|p| p.as_any().downcast_ref::<CachedPageIndexes>());
         let mut missing = Self::new();
         for &(rg, leaf) in &self.column_indexes {
             if metadata
@@ -87,8 +146,7 @@ impl PageIndexSelection {
                 .column(leaf)
                 .column_index_range()
                 .is_some()
-                && !cached.is_some_and(|c| c.column_indexes.contains_key(&(rg, leaf)))
-                && provider.is_none_or(|p| p.column_index(rg, leaf).is_none())
+                && !Self::column_resolved(provider, rg, leaf)
             {
                 missing.add_column_index(rg, leaf);
             }
@@ -99,8 +157,7 @@ impl PageIndexSelection {
                 .column(leaf)
                 .offset_index_range()
                 .is_some()
-                && !cached.is_some_and(|c| c.offset_indexes.contains_key(&(rg, leaf)))
-                && provider.is_none_or(|p| p.offset_index(rg, leaf).is_none())
+                && !Self::offset_resolved(provider, rg, leaf)
             {
                 missing.add_offset_index(rg, leaf);
             }
@@ -153,6 +210,33 @@ impl CachedPageIndexes {
             for (key, index) in offsets {
                 if let Some(entry) = result.offset_indexes.get_mut(&key) {
                     *entry = Some(Arc::new(index));
+                }
+            }
+        }
+        result
+    }
+
+    /// Preserves all resolved entries in metadata before extending its indexes.
+    /// Generic providers expose only positive entries, which must be copied.
+    pub(crate) fn from_metadata(metadata: &ParquetMetaData) -> Self {
+        let Some(provider) = metadata.page_index() else {
+            return Self::default();
+        };
+        if let Some(cached) = provider.as_any().downcast_ref::<Self>() {
+            return cached.clone();
+        }
+        let mut result = Self::default();
+        for (rg, group) in metadata.row_groups().iter().enumerate() {
+            for leaf in 0..group.num_columns() {
+                if let Some(index) = provider.column_index(rg, leaf) {
+                    result
+                        .column_indexes
+                        .insert((rg, leaf), Some(Arc::new(index.clone())));
+                }
+                if let Some(index) = provider.offset_index(rg, leaf) {
+                    result
+                        .offset_indexes
+                        .insert((rg, leaf), Some(Arc::new(index.clone())));
                 }
             }
         }
@@ -516,6 +600,40 @@ mod tests {
         assert!(!decoded.is_complete());
         assert!(decoded.column_index(0, 1).is_none());
         assert!(decoded.offset_index(0, 0).is_none());
+    }
+
+    #[test]
+    fn page_index_selection_whole_file_coverage_preserves_negative_resolutions() {
+        let metadata = metadata(true);
+        assert!(!PageIndexSelection::all_resolved(&metadata));
+        assert!(PageIndexSelection::all_resolved(&self::metadata(false)));
+        let full = PageIndexSelection::all_missing(&metadata);
+        assert_eq!(full.column_indexes().len(), 9);
+        assert_eq!(full.offset_indexes().len(), 9);
+
+        let mut partial = PageIndexSelection::new();
+        partial.add_column_index(1, 0);
+        partial.add_offset_index(2, 1);
+        let negative = CachedPageIndexes::from_decoded(None, &partial);
+        let metadata = metadata
+            .into_builder()
+            .set_page_index(Some(Arc::new(negative)))
+            .build();
+        let previous = CachedPageIndexes::from_metadata(&metadata);
+        assert!(partial.missing(&metadata, Some(&previous)).is_empty());
+        assert!(!PageIndexSelection::all_resolved(&metadata));
+        let missing = PageIndexSelection::all_missing(&metadata);
+        assert_eq!(missing.column_indexes().len(), 8);
+        assert_eq!(missing.offset_indexes().len(), 8);
+        assert!(!missing.column_indexes().contains(&(1, 0)));
+        assert!(!missing.offset_indexes().contains(&(2, 1)));
+        let resolved = previous.merge(&CachedPageIndexes::from_decoded(None, &missing));
+        let metadata = metadata
+            .into_builder()
+            .set_page_index(Some(Arc::new(resolved)))
+            .build();
+        assert!(PageIndexSelection::all_resolved(&metadata));
+        assert!(PageIndexSelection::all_missing(&metadata).is_empty());
     }
 
     #[test]

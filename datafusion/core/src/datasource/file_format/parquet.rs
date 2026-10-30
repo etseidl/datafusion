@@ -377,18 +377,18 @@ mod tests {
         let df_meta =
             df_meta.with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)));
 
-        // Increases by 3 because cache has no entries yet
+        // Increases by 2 to fetch the footer; no page indexes are requested.
         df_meta.fetch_metadata().await?;
-        assert_eq!(store.request_count(), 5);
+        assert_eq!(store.request_count(), 4);
 
         // No increase because cache has an entry
         df_meta.fetch_metadata().await?;
-        assert_eq!(store.request_count(), 5);
+        assert_eq!(store.request_count(), 4);
 
         // Increase by 2  because `get_file_metadata_cache()` is None
         let df_meta = df_meta.with_file_metadata_cache(None);
         df_meta.fetch_metadata().await?;
-        assert_eq!(store.request_count(), 7);
+        assert_eq!(store.request_count(), 6);
 
         let force_views = match force_views {
             ForceViews::Yes => true,
@@ -397,18 +397,18 @@ mod tests {
         let format = ParquetFormat::default()
             .with_metadata_size_hint(Some(9))
             .with_force_view_types(force_views);
-        // Increase by 3, partial cache being used.
+        // Increase by 2 to fetch the uncached file's footer.
         let _schema = format.infer_schema(&ctx, &store.upcast(), &meta).await?;
-        assert_eq!(store.request_count(), 10);
-        // No increase, full cache being used.
+        assert_eq!(store.request_count(), 8);
+        // No increase, both file footers are cached.
         let schema = format.infer_schema(&ctx, &store.upcast(), &meta).await?;
-        assert_eq!(store.request_count(), 10);
+        assert_eq!(store.request_count(), 8);
 
         // No increase, cache being used
         let df_meta =
             df_meta.with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)));
         let stats = df_meta.fetch_statistics(&schema).await?;
-        assert_eq!(store.request_count(), 10);
+        assert_eq!(store.request_count(), 8);
 
         assert_eq!(stats.num_rows, Precision::Exact(3));
         let c1_stats = &stats.column_statistics[0];
@@ -529,13 +529,13 @@ mod tests {
         let (files, _file_names) = store_parquet(vec![batch1], false).await?;
 
         let state = SessionContext::new().state();
-        // Make metadata size hint None to keep original behavior
+        // Without a size hint, footer-only inference needs two requests.
         let format = ParquetFormat::default().with_metadata_size_hint(None);
         let _schema = format.infer_schema(&state, &store.upcast(), &files).await?;
-        assert_eq!(store.request_count(), 3);
+        assert_eq!(store.request_count(), 2);
         // No increase, cache being used.
         let schema = format.infer_schema(&state, &store.upcast(), &files).await?;
-        assert_eq!(store.request_count(), 3);
+        assert_eq!(store.request_count(), 2);
 
         // No increase in request count because cache is not empty
         let file_metadata_cache =
@@ -608,7 +608,8 @@ mod tests {
             .with_force_view_types(force_views)
             .with_metadata_size_hint(None);
         let schema = format.infer_schema(&state, &store.upcast(), &files).await?;
-        assert_eq!(store.request_count(), 6);
+        // Two footer requests per file; page indexes are deferred until scanning.
+        assert_eq!(store.request_count(), 4);
 
         let null_i64 = ScalarValue::Int64(None);
         let null_utf8 = if force_views {
@@ -624,7 +625,7 @@ mod tests {
             .with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)))
             .fetch_statistics(&schema)
             .await?;
-        assert_eq!(store.request_count(), 6);
+        assert_eq!(store.request_count(), 4);
         assert_eq!(stats.num_rows, Precision::Exact(3));
         // column c1
         let c1_stats = &stats.column_statistics[0];
@@ -653,7 +654,7 @@ mod tests {
             .with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)))
             .fetch_statistics(&schema)
             .await?;
-        assert_eq!(store.request_count(), 6);
+        assert_eq!(store.request_count(), 4);
         assert_eq!(stats.num_rows, Precision::Exact(3));
         // column c1: missing from the file so the table treats all 3 rows as null
         let c1_stats = &stats.column_statistics[0];
