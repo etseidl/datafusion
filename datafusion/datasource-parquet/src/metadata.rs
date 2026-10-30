@@ -7,6 +7,7 @@
 
 use crate::file_format::ObjectStoreFetch;
 use crate::leaf_resolver::LeafResolver;
+use crate::page_index_cache::{CachedPageIndexes, PageIndexSelection};
 use crate::{Int96Coercer, apply_file_schema_type_coercions};
 use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::compute::kernels::cmp::eq;
@@ -208,8 +209,8 @@ impl<'a> DFParquetMetadata<'a> {
     /// offset indexes), equivalent to
     /// [`ParquetMetaDataReader::with_page_index_policy`].
     ///
-    /// Passing `None` uses a default automatically, based on whether a metadata
-    /// cache is configured.
+    /// Passing `None` skips page indexes. The opener loads the entries needed
+    /// by a scan after pruning row groups with footer statistics.
     pub fn with_page_index_policy(
         mut self,
         page_index_policy: Option<PageIndexPolicy>,
@@ -264,7 +265,7 @@ impl<'a> DFParquetMetadata<'a> {
         //       → return
         let cache_metadata =
             !cfg!(feature = "parquet_encryption") || self.decryption_properties.is_none();
-        let page_index_policy = self.effective_page_index_policy(cache_metadata);
+        let page_index_policy = self.effective_page_index_policy();
 
         if cache_metadata
             && let Some(file_metadata_cache) = self.file_metadata_cache.as_ref()
@@ -300,19 +301,10 @@ impl<'a> DFParquetMetadata<'a> {
     }
 
     /// Resolve the [`PageIndexPolicy`] to use for a fetch.
-    fn effective_page_index_policy(&self, cache_metadata: bool) -> PageIndexPolicy {
-        self.page_index_policy.unwrap_or_else(|| {
-            // fetching the page index often requires a second IO (after the
-            // main metadata), so it is not free.
-            if cache_metadata && self.file_metadata_cache.is_some() {
-                // When there is a cache available, retrieve the page index
-                // heuristically on the assumption it will be used multiple
-                // times
-                PageIndexPolicy::Optional
-            } else {
-                PageIndexPolicy::Skip
-            }
-        })
+    fn effective_page_index_policy(&self) -> PageIndexPolicy {
+        // Planning needs the footer, not all page indexes. The opener derives
+        // the required column chunks after row-group pruning.
+        self.page_index_policy.unwrap_or(PageIndexPolicy::Skip)
     }
 
     /// Check whether `metadata` already has both the column index and the
@@ -320,9 +312,22 @@ impl<'a> DFParquetMetadata<'a> {
     ///
     /// Used to decide whether page index I/O can be skipped.
     fn metadata_has_page_index(metadata: &ParquetMetaData) -> bool {
-        metadata
-            .page_index()
-            .is_some_and(|page_index| page_index.is_complete())
+        let Some(provider) = metadata.page_index() else {
+            return false;
+        };
+        if !provider.as_any().is::<CachedPageIndexes>() {
+            return provider.is_complete();
+        }
+        let mut selection = PageIndexSelection::new();
+        for row_group in 0..metadata.num_row_groups() {
+            for leaf in 0..metadata.file_metadata().schema_descr().num_columns() {
+                selection.add_column_index(row_group, leaf);
+                selection.add_offset_index(row_group, leaf);
+            }
+        }
+        selection
+            .missing(metadata, Some(provider.as_ref()))
+            .is_empty()
     }
 
     /// Store `metadata` in the configured [`FileMetadataCache`], keyed by
@@ -332,13 +337,7 @@ impl<'a> DFParquetMetadata<'a> {
     /// [`Self::with_file_metadata_cache`].
     fn cache_metadata(&self, metadata: Arc<ParquetMetaData>) -> Result<()> {
         if let Some(file_metadata_cache) = &self.file_metadata_cache {
-            file_metadata_cache.put(
-                &self.object_meta.location,
-                CachedFileMetadataEntry::new(
-                    self.object_meta.clone(),
-                    Arc::new(CachedParquetMetaData::new(metadata)),
-                ),
-            );
+            cache_parquet_metadata(file_metadata_cache, self.object_meta, metadata);
         }
         Ok(())
     }
@@ -409,10 +408,7 @@ impl<'a> DFParquetMetadata<'a> {
         object_meta: &ObjectMeta,
         metadata: Arc<ParquetMetaData>,
     ) -> Result<Arc<ParquetMetaData>> {
-        if metadata
-            .page_index()
-            .is_some_and(|page_index| page_index.is_complete())
-        {
+        if Self::metadata_has_page_index(&metadata) {
             return Ok(metadata);
         }
         let metadata =
@@ -1087,15 +1083,129 @@ fn has_any_exact_match(
 }
 
 /// Wrapper to implement [`FileMetadata`] for [`ParquetMetaData`].
-pub struct CachedParquetMetaData(Arc<ParquetMetaData>);
+pub struct CachedParquetMetaData {
+    metadata: Arc<ParquetMetaData>,
+    index_memory_size: usize,
+}
 
 impl CachedParquetMetaData {
     pub fn new(metadata: Arc<ParquetMetaData>) -> Self {
-        Self(metadata)
+        let index_memory_size = metadata
+            .page_index()
+            .and_then(|provider| provider.as_any().downcast_ref::<CachedPageIndexes>())
+            .map_or(0, CachedPageIndexes::memory_size);
+        Self {
+            metadata,
+            index_memory_size,
+        }
     }
 
     pub fn parquet_metadata(&self) -> &Arc<ParquetMetaData> {
-        &self.0
+        &self.metadata
+    }
+}
+
+/// Preserve immutable same-file index snapshots during footer/cache updates.
+pub(crate) fn cache_parquet_metadata(
+    cache: &Arc<FileMetadataCache>,
+    object_meta: &ObjectMeta,
+    metadata: Arc<ParquetMetaData>,
+) {
+    let mut update = |current: Option<CachedFileMetadataEntry>| {
+        let mut indexes = CachedPageIndexes::default();
+        if let Some(current) = current {
+            if !current.is_valid_for(object_meta) {
+                // Do not let an older in-flight scan replace a newer file.
+                if current.meta.last_modified > object_meta.last_modified {
+                    return None;
+                }
+            }
+            if current.is_valid_for(object_meta)
+                && let Some(cached) = current
+                    .file_metadata
+                    .as_any()
+                    .downcast_ref::<CachedParquetMetaData>()
+            {
+                if metadata.page_index().is_none()
+                    && cached.metadata.page_index().is_some()
+                {
+                    return Some(current.clone());
+                }
+                if let Some(provider) = cached.metadata.page_index() {
+                    if let Some(cached_indexes) =
+                        provider.as_any().downcast_ref::<CachedPageIndexes>()
+                    {
+                        indexes = cached_indexes.clone();
+                    } else if metadata
+                        .page_index()
+                        .is_some_and(|index| index.as_any().is::<CachedPageIndexes>())
+                    {
+                        // A fully indexed warm entry must not be replaced by a
+                        // query subset. Generic providers cannot share entries
+                        // individually, so transfer their populated coordinates once.
+                        let mut selection = PageIndexSelection::new();
+                        for row_group in 0..cached.metadata.num_row_groups() {
+                            for leaf in 0..cached
+                                .metadata
+                                .file_metadata()
+                                .schema_descr()
+                                .num_columns()
+                            {
+                                selection.add_column_index(row_group, leaf);
+                                selection.add_offset_index(row_group, leaf);
+                            }
+                        }
+                        indexes = CachedPageIndexes::from_provider(
+                            provider.as_ref(),
+                            &selection,
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(provider) = metadata.page_index() {
+            if let Some(loaded) = provider.as_any().downcast_ref::<CachedPageIndexes>() {
+                indexes = indexes.merge(loaded);
+            } else {
+                return Some(CachedFileMetadataEntry::new(
+                    object_meta.clone(),
+                    Arc::new(CachedParquetMetaData::new(Arc::clone(&metadata))),
+                ));
+            }
+        } else {
+            return Some(CachedFileMetadataEntry::new(
+                object_meta.clone(),
+                Arc::new(CachedParquetMetaData::new(Arc::clone(&metadata))),
+            ));
+        }
+        let metadata = Arc::new(
+            metadata
+                .as_ref()
+                .clone()
+                .into_builder()
+                .set_page_index(Some(Arc::new(indexes)))
+                .build(),
+        );
+        Some(CachedFileMetadataEntry::new(
+            object_meta.clone(),
+            Arc::new(CachedParquetMetaData::new(metadata)),
+        ))
+    };
+    if !cache.update(&object_meta.location, &mut update) {
+        // Legacy custom caches retain the old whole-metadata behavior. Scoped
+        // snapshots are not admitted without an atomic merge implementation.
+        if !metadata
+            .page_index()
+            .is_some_and(|provider| provider.as_any().is::<CachedPageIndexes>())
+        {
+            cache.put(
+                &object_meta.location,
+                CachedFileMetadataEntry::new(
+                    object_meta.clone(),
+                    Arc::new(CachedParquetMetaData::new(metadata)),
+                ),
+            );
+        }
     }
 }
 
@@ -1105,12 +1215,12 @@ impl FileMetadata for CachedParquetMetaData {
     }
 
     fn memory_size(&self) -> usize {
-        self.0.memory_size()
+        self.metadata.memory_size() + self.index_memory_size
     }
 
     fn extra_info(&self) -> HashMap<String, String> {
         let page_index = self
-            .0
+            .metadata
             .page_index()
             .is_some_and(|page_index| page_index.is_complete());
         HashMap::from([("page_index".to_owned(), page_index.to_string())])
@@ -1254,6 +1364,144 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow::compute::SortOptions;
     use arrow::datatypes::Field;
+
+    #[test]
+    fn test_scoped_cache_merge_identity_and_accounting() {
+        use datafusion_execution::cache::default_cache::DefaultCache;
+        use parquet::file::metadata::page_index::PageIndexBuilder;
+        use parquet::file::metadata::{
+            ColumnChunkMetaData, ColumnIndexBuilder, FileMetaData,
+        };
+        use parquet::schema::types::Type;
+        use std::sync::Barrier;
+        use std::thread;
+
+        let fields = (0..2)
+            .map(|i| {
+                Arc::new(
+                    Type::primitive_type_builder(&format!("c{i}"), PhysicalType::INT32)
+                        .build()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let schema = Arc::new(SchemaDescriptor::new(Arc::new(
+            Type::group_type_builder("schema")
+                .with_fields(fields)
+                .build()
+                .unwrap(),
+        )));
+        let columns = (0..2)
+            .map(|i| {
+                ColumnChunkMetaData::builder(schema.column(i))
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let row_group = RowGroupMetaData::builder(Arc::clone(&schema))
+            .set_num_rows(1)
+            .set_column_metadata(columns)
+            .build()
+            .unwrap();
+        let footer = Arc::new(ParquetMetaData::new(
+            FileMetaData::new(1, 1, None, None, schema, None),
+            vec![row_group],
+        ));
+        let object_meta = ObjectMeta {
+            location: Path::from("shared.parquet"),
+            size: 100,
+            last_modified: chrono::Utc::now(),
+            e_tag: None,
+            version: None,
+        };
+        let concrete = Arc::new(DefaultCache::new(1024 * 1024));
+        let cache: Arc<FileMetadataCache> = concrete.clone();
+        cache_parquet_metadata(&cache, &object_meta, Arc::clone(&footer));
+        let original = cache.get(&object_meta.location).unwrap();
+        let original_size = original.file_metadata.memory_size();
+        let barrier = Arc::new(Barrier::new(2));
+        let threads: Vec<_> = (0..2)
+            .map(|leaf| {
+                let cache = Arc::clone(&cache);
+                let footer = Arc::clone(&footer);
+                let object_meta = object_meta.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let mut column = ColumnIndexBuilder::new(PhysicalType::INT32);
+                    column.append(
+                        false,
+                        1i32.to_le_bytes().to_vec(),
+                        2i32.to_le_bytes().to_vec(),
+                        0,
+                        None,
+                    );
+                    let mut builder = PageIndexBuilder::new(1, 2);
+                    builder.put_column_index(column.build().unwrap(), 0, leaf);
+                    let mut selection = PageIndexSelection::new();
+                    selection.add_column_index(0, leaf);
+                    let indexes = CachedPageIndexes::from_decoded(
+                        Some(builder.build()),
+                        &selection,
+                    );
+                    let metadata = Arc::new(
+                        footer
+                            .as_ref()
+                            .clone()
+                            .into_builder()
+                            .set_page_index(Some(Arc::new(indexes)))
+                            .build(),
+                    );
+                    barrier.wait();
+                    cache_parquet_metadata(&cache, &object_meta, metadata);
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let entry = cache.get(&object_meta.location).unwrap();
+        let metadata = entry
+            .file_metadata
+            .as_any()
+            .downcast_ref::<CachedParquetMetaData>()
+            .unwrap()
+            .parquet_metadata();
+        let indexes = metadata.page_index().unwrap();
+        assert!(indexes.column_index(0, 0).is_some());
+        assert!(indexes.column_index(0, 1).is_some());
+        assert_eq!(original.file_metadata.memory_size(), original_size);
+        assert!(entry.file_metadata.memory_size() > original_size);
+        cache_parquet_metadata(&cache, &object_meta, Arc::clone(&footer));
+        assert_eq!(
+            concrete.memory_used(),
+            cache
+                .list_entries()
+                .values()
+                .map(|entry| entry.size_bytes)
+                .sum::<usize>()
+                + object_meta.location.as_ref().len()
+        );
+        // A new file incarnation invalidates all previous coordinates; an old
+        // in-flight update must not overwrite that newer footer.
+        let mut newer = object_meta.clone();
+        newer.last_modified += chrono::Duration::seconds(1);
+        cache_parquet_metadata(&cache, &newer, Arc::clone(&footer));
+        cache_parquet_metadata(&cache, &object_meta, metadata.clone());
+        let entry = cache.get(&object_meta.location).unwrap();
+        assert!(entry.is_valid_for(&newer));
+        assert!(
+            entry
+                .file_metadata
+                .as_any()
+                .downcast_ref::<CachedParquetMetaData>()
+                .unwrap()
+                .parquet_metadata()
+                .page_index()
+                .is_none()
+        );
+        cache.remove(&object_meta.location);
+        assert_eq!(concrete.memory_used(), 0);
+    }
 
     #[test]
     fn test_lex_ordering_to_sorting_columns_uses_writer_schema() -> Result<()> {

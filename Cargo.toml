@@ -333,6 +333,27 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 ] }
 unused_qualifications = "deny"
 
+# Prototype dependency for scoped page-index ownership and loading (arrow-rs #11475).
+[patch.crates-io]
+arrow = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-arith = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-array = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-avro = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-buffer = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-cast = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-cmp = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-csv = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-data = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-flight = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-ipc = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-json = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-ord = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-row = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-schema = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-select = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+arrow-string = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+parquet = { git = "https://github.com/etseidl/arrow-rs", rev = "e1d49438407325f0ff0057ae9c141c3016a92921" }
+
 # --------------------
 # Compilation Profiles
 # --------------------

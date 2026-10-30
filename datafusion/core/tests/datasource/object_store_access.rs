@@ -865,19 +865,16 @@ async fn create_single_parquet_file_too_small_prefetch() {
         .with_parquet_metadata_size_hint(Some(500))
         .with_single_file_parquet()
         .await;
-    // expect three get requests:
-    // 1. read the footer (500 bytes per hint, not enough for the footer metadata)
-    // 2. Read the footer metadata
-    // 3. reads the PageIndex
+    // Planning reads the footer in two requests, but leaves page indexes
+    // for a selective scan to load on demand.
     assert_snapshot!(
         test.requests(),
         @r"
     RequestCountingObjectStore()
-    Total Requests: 4
+    Total Requests: 3
     - GET  (opts) path=parquet_table.parquet head=true
     - GET  (ranges) path=parquet_table.parquet ranges=2494-2994
     - GET  (ranges) path=parquet_table.parquet ranges=2264-2986
-    - GET  (ranges) path=parquet_table.parquet ranges=2124-2264
     "
     );
 }
@@ -898,17 +895,14 @@ async fn create_single_parquet_file_small_prefetch() {
         .with_parquet_metadata_size_hint(Some(740))
         .with_single_file_parquet()
         .await;
-    // expect two get requests:
-    // 1. read the footer metadata
-    // 2. reads the PageIndex
+    // One footer read is sufficient for planning; indexes remain deferred.
     assert_snapshot!(
         test.requests(),
         @r"
     RequestCountingObjectStore()
-    Total Requests: 3
+    Total Requests: 2
     - GET  (opts) path=parquet_table.parquet head=true
     - GET  (ranges) path=parquet_table.parquet ranges=2254-2994
-    - GET  (ranges) path=parquet_table.parquet ranges=2124-2264
     "
     );
 }
@@ -974,8 +968,9 @@ async fn query_single_parquet_file_with_single_predicate() {
     +----------------------+----------------------+
     ------- Object Store Request Summary -------
     RequestCountingObjectStore()
-    Total Requests: 2
+    Total Requests: 3
     - GET  (opts) path=parquet_table.parquet head=true
+    - GET  (opts) path=parquet_table.parquet range=2170-2264
     - GET  (ranges) path=parquet_table.parquet ranges=1064-1594,1594-2124
     "
     );
@@ -998,8 +993,9 @@ async fn query_single_parquet_file_multi_row_groups_multiple_predicates() {
     +----------------------+----------------------+
     ------- Object Store Request Summary -------
     RequestCountingObjectStore()
-    Total Requests: 3
+    Total Requests: 4
     - GET  (opts) path=parquet_table.parquet head=true
+    - GET  (opts) path=parquet_table.parquet range=2124-2264
     - GET  (ranges) path=parquet_table.parquet ranges=4-534,534-1064
     - GET  (ranges) path=parquet_table.parquet ranges=1064-1594,1594-2124
     "

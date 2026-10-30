@@ -24,6 +24,7 @@ use datafusion_pruning::{MAX_IN_LIST_SIZE, PruningPredicate, PruningPredicateBui
 
 use log::{debug, trace};
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
+use parquet::arrow::parquet_column;
 use parquet::file::metadata::page_index::PageIndexProvider;
 use parquet::file::page_index::offset_index::PageLocation;
 use parquet::schema::types::SchemaDescriptor;
@@ -303,9 +304,17 @@ impl PagePruningAccessPlanFilter {
             // The selection for this particular row group
             let mut overall_selection = None;
 
+            // A scoped provider need not include leaf zero. Use a loaded
+            // predicate leaf as the reference for page-pruning metrics.
             let total_pages_in_group = parquet_metadata
                 .page_index()
-                .and_then(|page_index| page_index.offset_index(row_group_index, 0))
+                .and_then(|page_index| {
+                    self.predicate_column_names().find_map(|name| {
+                        let (leaf, _) =
+                            parquet_column(parquet_schema, arrow_schema, name)?;
+                        page_index.offset_index(row_group_index, leaf)
+                    })
+                })
                 .map_or(0, |offset_index| offset_index.page_locations().len());
             // stores the indexes of the matched pages
             matched_pages_in_group.clear();
@@ -590,7 +599,13 @@ fn fully_matched_page_count(
 ) -> usize {
     parquet_metadata
         .page_index()
-        .and_then(|page_index| page_index.offset_index(row_group_index, 0))
+        .and_then(|page_index| {
+            (0..parquet_metadata
+                .file_metadata()
+                .schema_descr()
+                .num_columns())
+                .find_map(|leaf| page_index.offset_index(row_group_index, leaf))
+        })
         .map_or(0, |offset_index| offset_index.page_locations().len())
 }
 

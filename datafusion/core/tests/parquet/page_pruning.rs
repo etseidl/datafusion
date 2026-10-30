@@ -979,8 +979,21 @@ async fn without_pushdown_filter() {
     )
     .unwrap();
 
-    // Same amount of bytes are scanned when defaulting to cache parquet metadata
-    assert_eq!(bytes_scanned_with_filter, bytes_scanned_without_filter);
+    // A cold filtered scan now includes deferred index I/O; schema/statistics
+    // planning caches only the footer. Repeating the query reuses its indexes.
+    let repeated = context
+        .query("SELECT * FROM t where nanos < to_timestamp('2023-01-02 01:01:11Z')")
+        .await;
+    let warm_bytes = cast_count_metric(
+        repeated
+            .parquet_metrics
+            .sum_by_name("bytes_scanned")
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(bytes_scanned_with_filter > warm_bytes);
+    assert!(warm_bytes <= bytes_scanned_without_filter);
+    assert_eq!(repeated.result_rows, output2.result_rows);
 }
 
 #[tokio::test]

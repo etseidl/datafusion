@@ -6,14 +6,13 @@
 //! low level control of parquet file readers
 
 use crate::ParquetFileMetrics;
-use crate::metadata::DFParquetMetadata;
+use crate::metadata::{DFParquetMetadata, cache_parquet_metadata};
+use crate::page_index_cache::CachedPageIndexes;
 use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
 use datafusion_common::HashMap;
 use datafusion_datasource::PartitionedFile;
-use datafusion_execution::cache::cache_manager::{
-    CachedFileMetadataEntry, FileMetadata, FileMetadataCache,
-};
+use datafusion_execution::cache::cache_manager::{FileMetadata, FileMetadataCache};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::FutureExt;
 use futures::TryFutureExt;
@@ -78,6 +77,17 @@ pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
         metadata_size_hint: Option<usize>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>>;
+
+    /// Return cached decoded page-index entries for this file, if available.
+    ///
+    /// The default returns no entries. The opener still loads required misses.
+    fn cached_page_indexes(
+        &self,
+        _partitioned_file: &PartitionedFile,
+        _options: &ArrowReaderOptions,
+    ) -> CachedPageIndexes {
+        CachedPageIndexes::default()
+    }
 
     /// Retain metadata augmented after the initial request, such as a deferred
     /// page-index load, for subsequent readers of the same file.
@@ -185,6 +195,35 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         Ok(Box::new(reader))
     }
 
+    fn cached_page_indexes(
+        &self,
+        partitioned_file: &PartitionedFile,
+        options: &ArrowReaderOptions,
+    ) -> CachedPageIndexes {
+        #[cfg(feature = "parquet_encryption")]
+        if options.file_decryption_properties().is_some() {
+            return CachedPageIndexes::default();
+        }
+        #[cfg(not(feature = "parquet_encryption"))]
+        let _ = options;
+        self.metadata_cache
+            .get(&partitioned_file.object_meta.location)
+            .filter(|entry| entry.is_valid_for(&partitioned_file.object_meta))
+            .and_then(|entry| {
+                let cached = entry
+                    .file_metadata
+                    .as_any()
+                    .downcast_ref::<crate::metadata::CachedParquetMetaData>()?;
+                cached
+                    .parquet_metadata()
+                    .page_index()?
+                    .as_any()
+                    .downcast_ref::<CachedPageIndexes>()
+                    .cloned()
+            })
+            .unwrap_or_default()
+    }
+
     fn cache_metadata(
         &self,
         partitioned_file: &PartitionedFile,
@@ -198,12 +237,10 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         #[cfg(not(feature = "parquet_encryption"))]
         let _ = options;
 
-        self.metadata_cache.put(
-            &partitioned_file.object_meta.location,
-            CachedFileMetadataEntry::new(
-                partitioned_file.object_meta.clone(),
-                Arc::new(crate::metadata::CachedParquetMetaData::new(metadata)),
-            ),
+        cache_parquet_metadata(
+            &self.metadata_cache,
+            &partitioned_file.object_meta,
+            metadata,
         );
     }
 }

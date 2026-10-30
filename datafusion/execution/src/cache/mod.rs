@@ -36,6 +36,16 @@ pub trait Cache<K: CacheKey, V: CacheValue>: Send + Sync {
     /// Returns the previous value if one existed.
     fn put(&self, key: &K, value: V) -> Option<V>;
 
+    /// Atomically compute and admit a replacement from the current value.
+    ///
+    /// Returns `false` when unsupported; the default does not invoke `update`.
+    /// Implementations supporting this operation must hold their mutation lock
+    /// while invoking the callback. Returning `None` leaves the entry unchanged.
+    /// The callback must not call back into this cache or perform blocking I/O.
+    fn update(&self, _key: &K, _update: &mut dyn FnMut(Option<V>) -> Option<V>) -> bool {
+        false
+    }
+
     /// Remove an entry from the cache, returning the value if it existed.
     fn remove(&self, k: &K) -> Option<V>;
 

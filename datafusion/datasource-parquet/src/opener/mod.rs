@@ -15,6 +15,7 @@ use crate::access_plan::PreparedAccessPlan;
 use crate::decoder_projection::DecoderProjection;
 use crate::metrics::{ByteProgress, RowFilterSkippedFullyMatchedMetric};
 use crate::page_filter::PagePruningAccessPlanFilter;
+use crate::page_index_cache::{CachedPageIndexes, PageIndexSelection};
 use crate::push_decoder::{
     DecoderBuilderConfig, InitialDecoderState, PushDecoderStreamState, RgPlanEntry,
     RowFilterContext, RowGroupPruner,
@@ -1405,7 +1406,12 @@ impl RowGroupsPrunedParquetOpen {
                     .iter()
                     .enumerate()
                     .any(|(leaf_idx, column)| {
-                        read_plans.reads_leaf(leaf_idx)
+                        (read_plans
+                            .projection
+                            .projection_mask()
+                            .leaf_included(leaf_idx)
+                            || (!row_groups.is_fully_matched()[idx]
+                                && read_plans.reads_leaf(leaf_idx)))
                             && column.offset_index_offset().is_some()
                     })
             }) {
@@ -1457,22 +1463,117 @@ impl RowGroupsPrunedParquetOpen {
                     PageIndexPolicy::Skip
                 },
             );
-        let reader_metadata = load_page_index(
-            self.prepared.loaded.reader_metadata.clone(),
-            &mut self.prepared.loaded.prepared.async_file_reader,
-            options.clone(),
-        )
-        .await?;
-        // The deferred byte-range load bypasses the reader's get_metadata cache.
-        self.prepared
-            .loaded
+        let metadata = Arc::clone(self.prepared.loaded.reader_metadata.metadata());
+        let read_plans = match &self.decoder_read_plans {
+            Some(plans) => plans,
+            None => self.decoder_read_plans.insert(DecoderReadPlans::try_new(
+                &self.prepared.loaded.prepared,
+                &self.prepared.loaded.reader_metadata,
+            )?),
+        };
+        let predicate_leaves: Vec<_> = self
             .prepared
+            .page_pruning_predicate
+            .as_ref()
+            .map(|predicate| {
+                predicate
+                    .predicate_column_names()
+                    .filter_map(|name| {
+                        parquet_column(
+                            metadata.file_metadata().schema_descr(),
+                            &self.prepared.loaded.prepared.physical_file_schema,
+                            name,
+                        )
+                        .map(|(leaf, _)| leaf)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut selection = PageIndexSelection::new();
+        for row_group in self.row_groups.row_group_indexes() {
+            let group = metadata.row_group(row_group);
+            let mut prunable = false;
+            if !self.row_groups.is_fully_matched()[row_group] {
+                for &leaf in &predicate_leaves {
+                    let column = group.column(leaf);
+                    if column.column_index_range().is_some()
+                        && column.offset_index_range().is_some()
+                    {
+                        selection.add_column_index(row_group, leaf);
+                        selection.add_offset_index(row_group, leaf);
+                        prunable = true;
+                    }
+                }
+            }
+            let partial_selection =
+                match &self.row_groups.access_plan().inner()[row_group] {
+                    RowGroupAccess::Selection(selection) => match selection.as_mask() {
+                        Some(mask) => MaskRunIter::new(mask).nth(1).is_some(),
+                        None => selection.iter().nth(1).is_some(),
+                    },
+                    _ => false,
+                };
+            if prunable || partial_selection {
+                for (leaf, column) in group.columns().iter().enumerate() {
+                    let reads_leaf =
+                        read_plans.projection.projection_mask().leaf_included(leaf)
+                            || (!self.row_groups.is_fully_matched()[row_group]
+                                && read_plans.reads_leaf(leaf));
+                    if reads_leaf && column.offset_index_range().is_some() {
+                        selection.add_offset_index(row_group, leaf);
+                    }
+                }
+            }
+        }
+        let prepared = &mut self.prepared.loaded.prepared;
+        let mut indexes = prepared
             .parquet_file_reader_factory
-            .cache_metadata(
-                &self.prepared.loaded.prepared.partitioned_file,
-                Arc::clone(reader_metadata.metadata()),
-                &options,
+            .cached_page_indexes(&prepared.partitioned_file, &options);
+        if let Some(provider) = metadata.page_index() {
+            indexes = indexes.merge(&CachedPageIndexes::from_provider(
+                provider.as_ref(),
+                &selection,
+            ));
+        }
+        let missing = selection.missing(&metadata, Some(&indexes));
+        if !missing.is_empty() {
+            let reader =
+                ParquetMetaDataReader::new_with_metadata(metadata.as_ref().clone())
+                    .with_column_index_policy(PageIndexPolicy::Optional)
+                    .with_offset_index_policy(PageIndexPolicy::Optional)
+                    .with_column_index_mask(missing.column_index_mask())
+                    .with_offset_index_mask(missing.offset_index_mask());
+            #[cfg(feature = "parquet_encryption")]
+            let reader = reader.with_decryption_properties(
+                options.file_decryption_properties().map(Arc::clone),
             );
+            let (_, decoded) = reader
+                .load_page_index_and_finish(&mut prepared.async_file_reader)
+                .await?;
+            indexes = indexes.merge(&CachedPageIndexes::from_decoded(decoded, &missing));
+        }
+        // Retain every decoded Cartesian-mask entry, not just this query's subset.
+        let cached_metadata = Arc::new(
+            metadata
+                .as_ref()
+                .clone()
+                .into_builder()
+                .set_page_index(Some(Arc::new(indexes.clone())))
+                .build(),
+        );
+        prepared.parquet_file_reader_factory.cache_metadata(
+            &prepared.partitioned_file,
+            cached_metadata,
+            &options,
+        );
+        let query_metadata = metadata
+            .as_ref()
+            .clone()
+            .into_builder()
+            .set_page_index(Some(Arc::new(indexes.subset(&selection))))
+            .build();
+        let reader_metadata =
+            ArrowReaderMetadata::try_new(Arc::new(query_metadata), options.clone())?;
         self.prepared.loaded.reader_metadata = reader_metadata;
 
         Ok(self)
@@ -2104,6 +2205,7 @@ pub(crate) fn build_pruning_predicates(
 
 /// Returns a `ArrowReaderMetadata` with the page index loaded, loading
 /// it from the underlying `AsyncFileReader` if necessary.
+#[cfg(test)]
 async fn load_page_index<T: AsyncFileReader>(
     reader_metadata: ArrowReaderMetadata,
     input: &mut T,
@@ -5361,6 +5463,203 @@ mod test {
             Some("false"),
             "cached metadata should not include page index when opener skips it"
         );
+    }
+
+    #[tokio::test]
+    async fn test_scoped_offsets_exclude_fully_matched_filter_leaf() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let cache: Arc<FileMetadataCache> = Arc::new(DefaultCache::new(1024 * 1024));
+        let batch = record_batch!(
+            ("filter", Int32, (0..10).collect::<Vec<_>>()),
+            ("output", Int32, (0..10).collect::<Vec<_>>())
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(2)
+            .set_write_batch_size(2)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+        let len = write_parquet_batches(
+            Arc::clone(&store),
+            "matched.parquet",
+            vec![batch],
+            Some(props),
+        )
+        .await;
+        let mut plan = ParquetAccessPlan::new_all(1);
+        plan.scan_selection(
+            0,
+            RowSelection::from(vec![RowSelector::skip(8), RowSelector::select(2)]),
+        );
+        let file = PartitionedFile::new("matched.parquet".to_string(), len as u64)
+            .with_extension(plan);
+        let opener = ParquetMorselizerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[1])
+            .with_predicate(logical2physical(&col("filter").gt_eq(lit(0i32)), &schema))
+            .with_enable_page_index(true)
+            .with_pushdown_filters(true)
+            .with_row_group_stats_pruning(true)
+            .with_parquet_file_reader_factory(Arc::new(
+                CachedParquetFileReaderFactory::new(
+                    Arc::clone(&store),
+                    Arc::clone(&cache),
+                ),
+            ))
+            .build();
+        let batches = open_file(&opener, file.clone())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        let entry = cache.get(&file.object_meta.location).unwrap();
+        let cached = entry
+            .file_metadata
+            .as_any()
+            .downcast_ref::<CachedParquetMetaData>()
+            .unwrap();
+        let indexes = cached.parquet_metadata().page_index().unwrap();
+        assert!(!indexes.has_column_indexes());
+        assert!(indexes.offset_index(0, 0).is_none());
+        assert!(indexes.offset_index(0, 1).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_scoped_page_indexes_reuse_and_extend() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let cache: Arc<FileMetadataCache> = Arc::new(DefaultCache::new(1024 * 1024));
+        let values: Vec<i32> = (0..30).collect();
+        let batch = record_batch!(
+            ("unused", Int32, values.clone()),
+            ("filter", Int32, values.clone()),
+            ("output", Int32, values.clone()),
+            ("other", Int32, values.clone())
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_dictionary_enabled(false)
+            .set_max_row_group_row_count(Some(10))
+            .set_data_page_row_count_limit(2)
+            .set_write_batch_size(2)
+            .build();
+        let len = write_parquet_batches(
+            Arc::clone(&store),
+            "scoped.parquet",
+            vec![batch],
+            Some(props),
+        )
+        .await;
+        let file = PartitionedFile::new("scoped.parquet".to_string(), len as u64);
+        // Planning's default metadata policy must leave indexes undecoded.
+        let footer = DFParquetMetadata::new(store.as_ref(), &file.object_meta)
+            .with_file_metadata_cache(Some(Arc::clone(&cache)))
+            .fetch_metadata()
+            .await
+            .unwrap();
+        assert!(footer.page_index().is_none());
+        let mut original_index = None;
+        for (pass, projection) in [2, 2, 3, 2].into_iter().enumerate() {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let predicate = col("filter")
+                .gt_eq(lit(12i32))
+                .and(col("filter").lt(lit(14i32)));
+            let opener = ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_schema(Arc::clone(&schema))
+                .with_projection_indices(&[projection])
+                .with_predicate(logical2physical(&predicate, &schema))
+                .with_enable_page_index(true)
+                .with_pushdown_filters(true)
+                .with_row_group_stats_pruning(true)
+                .with_metrics(metrics.clone())
+                .with_parquet_file_reader_factory(Arc::new(
+                    CachedParquetFileReaderFactory::new(
+                        Arc::clone(&store),
+                        Arc::clone(&cache),
+                    ),
+                ))
+                .build();
+            let stream = open_file(&opener, file.clone()).await.unwrap();
+            let bytes = counter_metric_value(&metrics, "bytes_scanned");
+            if pass == 0 || pass == 2 {
+                assert!(bytes > 0);
+            } else {
+                assert_eq!(bytes, 0);
+            }
+            let entry = cache.get(&file.object_meta.location).unwrap();
+            let cached = entry
+                .file_metadata
+                .as_any()
+                .downcast_ref::<CachedParquetMetaData>()
+                .unwrap();
+            let metadata = cached.parquet_metadata();
+            let indexes = metadata.page_index().unwrap();
+            for rg in 0..3 {
+                for leaf in 0..4 {
+                    assert_eq!(
+                        indexes.column_index(rg, leaf).is_some(),
+                        rg == 1 && leaf == 1
+                    );
+                    assert_eq!(
+                        indexes.offset_index(rg, leaf).is_some(),
+                        rg == 1 && (leaf == 1 || leaf == 2 || (pass >= 2 && leaf == 3))
+                    );
+                }
+            }
+            let index = std::ptr::from_ref(indexes.column_index(1, 1).unwrap());
+            if let Some(original) = original_index {
+                assert_eq!(index, original);
+            }
+            original_index = Some(index);
+            assert!(entry.file_metadata.memory_size() > footer.memory_size());
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+            let result: Vec<_> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_primitive::<Int32Type>()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            assert_eq!(result, vec![12, 13]);
+        }
+        // A concurrent/footer-only update cannot discard cached coverage.
+        crate::metadata::cache_parquet_metadata(
+            &cache,
+            &file.object_meta,
+            Arc::clone(&footer),
+        );
+        assert_eq!(
+            cache
+                .get(&file.object_meta.location)
+                .unwrap()
+                .file_metadata
+                .extra_info()["page_index"],
+            "true"
+        );
+        // An explicit full-index request must not mistake a partial provider
+        // having both kinds for coverage of every advertised coordinate.
+        let full = DFParquetMetadata::new(store.as_ref(), &file.object_meta)
+            .with_file_metadata_cache(Some(Arc::clone(&cache)))
+            .with_page_index_policy(Some(PageIndexPolicy::Optional))
+            .fetch_metadata()
+            .await
+            .unwrap();
+        for rg in 0..3 {
+            for leaf in 0..4 {
+                assert!(full.page_index().unwrap().column_index(rg, leaf).is_some());
+                assert!(full.page_index().unwrap().offset_index(rg, leaf).is_some());
+            }
+        }
     }
 
     #[tokio::test]

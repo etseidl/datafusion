@@ -206,6 +206,16 @@ impl<K: CacheKey, V: CacheValue> Cache<K, V> for DefaultCache<K, V> {
         state.put(key, value, now)
     }
 
+    fn update(&self, key: &K, update: &mut dyn FnMut(Option<V>) -> Option<V>) -> bool {
+        let now = self.time_provider.now();
+        let mut state = self.state.lock().unwrap();
+        let current = state.get(key, now);
+        if let Some(value) = update(current) {
+            state.put(key, value, now);
+        }
+        true
+    }
+
     fn remove(&self, k: &K) -> Option<V> {
         let mut state = self.state.lock().unwrap();
         state.remove(k)
@@ -1590,6 +1600,61 @@ mod tests {
         // Earlier entries (LRU) should be evicted
         assert!(!cache.contains_key(&key1));
         assert!(!cache.contains_key(&key2));
+    }
+
+    #[test]
+    fn test_atomic_update_concurrent_union_and_accounting() {
+        let cache = Arc::new(DefaultCache::new(4096));
+        let object_meta = create_test_object_meta("atomic", 1);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let cache = Arc::clone(&cache);
+                let object_meta = object_meta.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    assert!(cache.update(
+                        &object_meta.location,
+                        &mut |old: Option<CachedFileMetadataEntry>| {
+                            let mut metadata = old
+                                .as_ref()
+                                .map(|entry| {
+                                    entry
+                                        .file_metadata
+                                        .as_any()
+                                        .downcast_ref::<TestFileMetadata>()
+                                        .unwrap()
+                                        .metadata
+                                        .clone()
+                                })
+                                .unwrap_or_default();
+                            metadata.push(char::from(b'a' + i));
+                            Some(CachedFileMetadataEntry::new(
+                                object_meta.clone(),
+                                Arc::new(TestFileMetadata { metadata }),
+                            ))
+                        }
+                    ));
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let entry = cache.get(&object_meta.location).unwrap();
+        let value = &entry
+            .file_metadata
+            .as_any()
+            .downcast_ref::<TestFileMetadata>()
+            .unwrap()
+            .metadata;
+        assert_eq!(value.len(), 8);
+        assert_eq!(cache.memory_used(), object_meta.location.size() + 8);
+        assert!(cache.update(&object_meta.location, &mut |_| None));
+        assert_eq!(cache.memory_used(), object_meta.location.size() + 8);
+        cache.remove(&object_meta.location);
+        assert_eq!(cache.memory_used(), 0);
     }
 
     #[test]
